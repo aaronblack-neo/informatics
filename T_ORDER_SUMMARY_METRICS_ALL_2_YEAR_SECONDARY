@@ -1,0 +1,51 @@
+                                          
+CREATE OR REPLACE TABLE  DW_CUR_INFDLC_DEV.DW.T_ORDER_SUMMARY_METRICS_ALL_2_YEAR_SECONDARY
+AS
+select  'Neo'                                                                                               as "Company Name"
+        , o_fact.technology_name                                                                            as "Technology Name"
+        , o_fact.test_name                                                                                  as "Test Name" 
+        --, o_fact.result_value                                                                             as "Result Values"
+        , CASE WHEN o_fact.result_value_standard = '' 
+                THEN 'None-Identified' 
+                ELSE COALESCE(o_fact.result_value_standard 
+                             ,CASE WHEN LENGTH(o_fact.result_value) >0 
+                                    THEN 'Not-Mapped' 
+                                    ELSE 'None-Identified' 
+                                    END
+                             , 'None-Identified') 
+                END                                                                                         AS "Result Standard Values"
+        , IFNULL(o_fact.technique, 'None-Identified')                                                       as "Technique"
+        , IFNULL(o_fact.panel_name ,'None-Identified')                                                      as "Panel Name"
+        , o_fact.technology_std                                                                             as "Technology Standard"
+    --facts
+        , MIN(DATE(case_dim.case_created_timestamp))                                                        as "First Case Created Date"
+        , MAX(DATE(case_dim.case_created_timestamp))                                                        as "Most Recent Case Created Date"                                                      
+    --overall counts
+        , COUNT(DISTINCT case_dim.service_level_name)                                                       as "Distinct Service Level"
+        , COUNT(o_fact.test_code)                                                                           as "Test Code Count"
+        , COUNT(DISTINCT o_fact.panel_name)                                                                 as "Distinct Panels"
+        , COUNT(DISTINCT case_dim.case_no)                                                                  as "Distinct Cases"
+        , COUNT(DISTINCT o_fact.result_value)                                                               as "Distinct Result Values"
+        , COUNT(DISTINCT o_fact.test_order_hub_id)                                                          as "Distinct Test Order Hub Id"
+        , COUNT(DISTINCT o_fact.gene_name)                                                                  as "Reported Variant Gene Count"
+        , COUNT(DISTINCT o_fact.variant_type)                                                               as "Distinct Variant Types"
+        , COUNT(DISTINCT CASE WHEN o_fact.panel_name is null then NULL ELSE  o_fact.case_no END )           as "Test Only Count"
+        , COUNT(DISTINCT CASE WHEN o_fact.panel_name is null then o_fact.case_no ELSE NULL END )            as "Panel Specified Count"
+        , COUNT(DISTINCT CASE WHEN IFNULL(o_fact.result_value,'') = '' THEN o_fact.case_no ELSE NULL END)   as "Test No Result"
+        , COUNT(DISTINCT CASE WHEN IFNULL(o_fact.result_value,'') <> '' THEN o_fact.case_no ELSE NULL END)  as "Test Has Result" 
+        , COUNT(DISTINCT case when CHARINDEX('NeoGenomics',lab_hub.lab_name) > 0
+            THEN lab_hub.lab_name else 'External Lab' END )                                                 as "Distinct Lab Site"
+--select o_fact.*
+    from nsf_daas_prd.data.orders_fact                              as o_fact
+    join nsf_daas_prd.data.case_dim                                 as case_dim
+        on case_dim.case_hub_id = o_fact.case_hub_id
+    inner join DW_CUR_PRD.DW.T_CASE_HUB                             as case_hub 
+        on case_hub.id = o_fact.case_hub_id
+    inner join dw_cur_prd.dw.T_lab_hub                              as lab_hub
+        on lab_hub.id = case_hub.lab
+    WHERE case_dim.case_created_timestamp >= DATEADD(YEAR, -2, CURRENT_DATE)
+        and o_fact.technology_name NOT IN ('Summary', 'Hold','IHC') 
+    and o_fact.result_status NOT IN ('MISSING RESULT', 'CANCELLED','NOT REPORTED','PENDING')
+    group by 1,2,3,4,5,6,7
+    
+
