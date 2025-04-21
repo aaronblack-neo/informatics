@@ -1,0 +1,410 @@
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, message="pandas only support SQLAlchemy connectable")
+warnings.filterwarnings("ignore", category=FutureWarning, message="Treating datetime data as categorical rather than numeric in `.describe`")
+
+from snowflake.snowpark import Session
+import snowflake.connector
+import os
+from snowflake.connector.pandas_tools import write_pandas
+import pandas as pd
+import csv
+import matplotlib.pyplot as plt
+import numpy as np    
+import sys
+from time import gmtime, strftime
+import seaborn as sns
+
+# Set the dark theme for seaborn
+sns.set(style='darkgrid')
+plt.style.use('default')
+
+##################################################################
+##DB connections - write ##########################################
+##################################################################
+con_dev_write = snowflake.connector.connect(
+    user="AARON.BLACK", 
+    account="neogenomics.east-us-2.azure", 
+    authenticator="externalbrowser",
+    role="DEVELOPER_NPE",
+    warehouse="BI_WH_XS_NPE",
+    database="DL_RAW_DEV", 
+    schema="SHARED"
+)
+cur_write = con_dev_write.cursor()
+#print(sys.executable)
+#print(sys.version)
+print('Connection: ')
+print(sys.version_info)
+
+import warnings
+
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=UserWarning, message="pandas only support SQLAlchemy connectable")
+warnings.filterwarnings("ignore", category=FutureWarning, message="Treating datetime data as categorical rather than numeric in `.describe`")
+
+import os
+import pandas as pd
+import csv
+import matplotlib.pyplot as plt
+import numpy as np    
+import sys
+from time import gmtime, strftime
+import seaborn as sns
+
+
+  
+def statistical_profile(df, table_name):
+    """
+    Generate a statistical profile for numeric and non-numeric columns of a given dataframe,
+    with numeric statistics rounded to 4 decimal places.
+    
+    :param df: pandas.DataFrame
+    :return: Two dataframes, one with statistics for numeric columns and another for non-numeric columns.
+    """
+    # Separate numeric and non-numeric columns
+    numeric_data = df.select_dtypes(include=['number'])
+    non_numeric_data = df.select_dtypes(exclude=['number'])
+    
+    if numeric_data.empty:
+        numeric_stats = pd.DataFrame({"Message": ["No numeric columns present."]})
+        print('Numeric data empty')
+    else:
+        # Removing columns with all null values
+        numeric_data = numeric_data.dropna(axis=1, how='all')
+        if numeric_data.empty:
+            numeric_stats = pd.DataFrame({"Message": ["All numeric columns are null."]})
+            print('All numeric columns are null')
+        else:
+            # Calculating descriptive statistics for numeric columns
+            numeric_stats = numeric_data.describe().transpose()
+            numeric_stats = numeric_stats.round(4)  # Rounding numeric statistics to 4 decimal places
+            numeric_stats['Null Count'] = numeric_data.isnull().sum()
+            numeric_stats['Null %'] = ((numeric_stats['Null Count'] / len(numeric_data)) * 100).round(4)
+            numeric_stats['Distinct Count'] = numeric_data.nunique()
+            numeric_stats['Distinct %'] = ((numeric_stats['Distinct Count'] / len(numeric_data)) * 100).round(4)
+            numeric_stats.index.rename('Column', inplace=True)
+            numeric_stats['table_name'] = table_name
+
+    # Handling non-numeric data
+    if non_numeric_data.empty:
+        non_numeric_stats = pd.DataFrame({"Message": ["No non-numeric columns present."]})
+        print('Non-numeric data empty')
+    else:
+        # Removing columns with all null values
+        non_numeric_data = non_numeric_data.dropna(axis=1, how='all')
+        if non_numeric_data.empty:
+            non_numeric_stats = pd.DataFrame({"Message": ["All non-numeric columns are null."]})
+            print('All non-numeric columns are null')
+        else:
+            # Calculating descriptive statistics for non-numeric columns
+            non_numeric_stats = non_numeric_data.describe().transpose()
+            non_numeric_stats['Null Count'] = non_numeric_data.isnull().sum()
+            non_numeric_stats['Null %'] = ((non_numeric_stats['Null Count'] / len(non_numeric_data)) * 100).round(4)
+            non_numeric_stats['Distinct Count'] = non_numeric_data.nunique()
+            non_numeric_stats['Distinct %'] = ((non_numeric_stats['Distinct Count'] / len(non_numeric_data)) * 100).round(4)
+            non_numeric_stats.index.rename('Column', inplace=True)
+            non_numeric_stats['table_name'] = table_name
+    
+    return numeric_stats, non_numeric_stats
+
+
+def plot_histograms_for_non_numeric(non_numeric_data, threshold=25):
+    """
+    Plot histograms for non-numeric columns with a reasonable number of distinct values.
+    
+    :param non_numeric_data: DataFrame containing non-numeric data.
+    :param threshold: Maximum number of distinct values to plot.
+    """
+    for column in non_numeric_data.columns:
+        value_counts = non_numeric_data[column].value_counts()
+        
+        # Skip columns with a count of 0
+        if value_counts.sum() == 0:
+            print(f"Column '{column}' has a count of 0 and will be skipped.")
+            continue
+        
+        if len(value_counts) <= threshold:
+            plt.figure(figsize=(10, 6))
+            sns.barplot(x=value_counts.values[:threshold], y=value_counts.index[:threshold], palette='Blues_r')
+            plt.title(f'Top {threshold} Values for {column}')
+            plt.xlabel('Frequency')
+            plt.ylabel(column)
+            plt.show()
+        else:
+            print(f"Column '{column}' has too many distinct values ({len(value_counts)}) to plot.")
+
+
+def data_frame_to_csv(data_frame, file_name, write_loc):
+    ##input is a data type which will also create a folder with that name, a dataframe that will be written, and file name to where it will be written
+    data_frame.columns = [' '.join(col).strip() if isinstance(col, tuple) else col for col in data_frame.columns.values]
+
+    ##set the name of the file
+    file_name = file_name + '.csv'
+
+    #write
+    file_path = write_loc + '/' + file_name
+
+    # Export the DataFrame to a CSV file at the specified location
+    data_frame.to_csv(file_path, index=True, sep=',', encoding='utf-8')  # Set index=False to exclude the index column from the file
+    message = 'Hell yeah....File Generation Complete for: ' + file_name + ' to: ' + file_path
+
+    return message
+
+#########
+def plot_numeric_column_statistics(numeric_data, low_variance_threshold=10):
+    """
+    Plot histograms and boxplots for numeric columns with appropriate checks.
+    
+    :param numeric_data: DataFrame containing numeric data.
+    :param low_variance_threshold: Threshold for considering a column as low variance.
+    """
+    for column in numeric_data.columns:
+        # Exclude binary columns, low variance columns, and unique value columns
+        unique_values = numeric_data[column].nunique()
+        if unique_values > 2 and unique_values < low_variance_threshold or unique_values == len(numeric_data):
+            continue
+
+        # Calculate mean and standard deviation
+        mean = numeric_data[column].mean()
+        std = numeric_data[column].std()
+
+        # Define the bounds for 3 and 2 standard deviations
+        lower_bound_3_std = mean - 3 * std
+        upper_bound_3_std = mean + 3 * std
+        lower_bound_2_std = mean - 2 * std
+        upper_bound_2_std = mean + 2 * std
+        
+        # Create a figure for subplots
+        fig, ax = plt.subplots(nrows=2, ncols=1, figsize=(8, 10))
+        
+        # Histogram
+        sns.histplot(numeric_data[column], ax=ax[0], kde=True, color='blue')
+        ax[0].set_title(f"Histogram of {column}")
+        ax[0].set_xlabel(column)
+        ax[0].set_ylabel('Frequency')
+        
+        # Add lines for 3 standard deviations on histogram
+        ax[0].axvline(x=lower_bound_3_std, color='red', linestyle='--', label='Lower 3 Std Dev')
+        ax[0].axvline(x=upper_bound_3_std, color='red', linestyle='--', label='Upper 3 Std Dev')
+        
+        # Add lines for 2 standard deviations on histogram
+        ax[0].axvline(x=lower_bound_2_std, color='darkblue', linestyle='--', label='Lower 2 Std Dev')
+        ax[0].axvline(x=upper_bound_2_std, color='darkblue', linestyle='--', label='Upper 2 Std Dev')
+        
+        ax[0].legend(loc='upper right')
+        
+        # Boxplot
+        sns.boxplot(x=numeric_data[column], ax=ax[1], color='lightblue')
+        ax[1].set_title(f"Boxplot of {column}")
+        ax[1].set_xlabel(column)
+        
+        # Add lines for 3 standard deviations on boxplot
+        ax[1].axvline(x=lower_bound_3_std, color='red', linestyle='--', label='Lower 3 Std Dev')
+        ax[1].axvline(x=upper_bound_3_std, color='red', linestyle='--', label='Upper 3 Std Dev')
+        
+        # Add lines for 2 standard deviations on boxplot
+        ax[1].axvline(x=lower_bound_2_std, color='darkblue', linestyle='--', label='Lower 2 Std Dev')
+        ax[1].axvline(x=upper_bound_2_std, color='darkblue', linestyle='--', label='Upper 2 Std Dev')
+        
+        ax[1].legend(loc='upper right')
+        
+        # Align x-axis range for histogram and boxplot
+        min_val = numeric_data[column].min()
+        max_val = numeric_data[column].max()
+        ax[0].set_xlim(min_val, max_val)
+        ax[1].set_xlim(min_val, max_val)
+        
+        # Display the plots
+        plt.tight_layout()
+        plt.show()
+        
+def calculate_and_plot_outliers(numeric_data):
+    """
+    Calculate and plot outliers for numeric columns in a given dataframe.
+    
+    :param numeric_data: DataFrame containing numeric data.
+    :return: DataFrame summarizing outliers for each numeric column.
+    """
+    # Initialize a list to hold the results
+    outliers_detailed_summary = []
+
+    # Loop through each numeric column
+    for column in numeric_data.columns:
+        # Calculate mean and standard deviation
+        mean = numeric_data[column].mean()
+        std = numeric_data[column].std()
+        
+        # Define the bounds for 3 standard deviations
+        lower_bound = mean - 3 * std
+        upper_bound = mean + 3 * std
+        
+        # Identify the outliers
+        outliers = numeric_data[column][(numeric_data[column] < lower_bound) | (numeric_data[column] > upper_bound)]
+        num_outliers = outliers.count()
+        total_values = numeric_data[column].notnull().sum()  # total number of non-null values
+        
+        # Calculate the percentage of outliers
+        percent_outliers = (num_outliers / total_values) * 100 if total_values > 0 else 0
+        
+        # Count how many are above and below 3 standard deviations
+        num_outliers_below = numeric_data[column][numeric_data[column] < lower_bound].count()
+        num_outliers_above = numeric_data[column][numeric_data[column] > upper_bound].count()
+        
+        # Append the results to the list
+        outliers_detailed_summary.append({
+            'Column': column,
+            'Num_Outliers': num_outliers,
+            'Num_Outliers_Below': num_outliers_below,
+            'Num_Outliers_Above': num_outliers_above,
+            'Min_Outlier_Value': outliers.min() if num_outliers > 0 else None,
+            'Max_Outlier_Value': outliers.max() if num_outliers > 0 else None,
+            'Total_Values': total_values,
+            'Percent_Outliers': percent_outliers
+        })
+
+        # Plot histogram and outliers
+        plt.figure(figsize=(10, 6))
+        sns.histplot(numeric_data[column], kde=True, color='blue')
+        plt.axvline(x=lower_bound, color='red', linestyle='--', label='Lower 3 Std Dev')
+        plt.axvline(x=upper_bound, color='red', linestyle='--', label='Upper 3 Std Dev')
+        plt.title(f"Histogram of {column} with Outliers")
+        plt.xlabel(column)
+        plt.ylabel('Frequency')
+        plt.legend(loc='upper right')
+        #plt.show()
+    
+    # Convert the list of results to a DataFrame
+    outliers_detailed_summary_df = pd.DataFrame(outliers_detailed_summary)
+    print(outliers_detailed_summary_df)
+    return outliers_detailed_summary_df
+
+tables = ['T_E_STORAGEUNIT', 'T_A_ACCESSION','T_E_CLIENT','T_M_LAB_TEST','T_E_PROJECT','T_E_SPECIMEN']
+#tables = ['T_E_SPECIMEN']
+#tables = ['vw_slide_images']
+#tables = ['T_M_MOL_CASE_SUMMARY_INTERPRETATION_TWO_YEAR']
+#tables = ['T_M_MOL_TEST_DETAIL_INTERPRETATION']
+#tables = ['T_M_MOL_TEST_DETAIL_INTERPRETATION_SUMMARY_TWO_YEAR']
+#tables = ['T_M_MOL_TEST_DETAIL_INTERPRETATION_SUMMARY_ONE_YEAR']
+#tables = ['T_M_MOL_TEST']
+#tables = ['T_M_MOL_TEST_MEASUREMENT']
+#tables = ['T_R_MOL_TEST_DETAIL_INTERPRETATION_SUMMARY_PIVOT']
+tables = ['VIEW_PHARMA_VOLUME_REPORT_DM']
+#dl_raw_dev.shared.vw_slide_images
+for table in tables:
+    
+    ## set table parameters
+    #db = 'NSF_LV8_DEV'
+    #db = 'DL_RAW_DEV'
+    db = 'DW_CUR_NEO_OPS_PRD'
+    #schema = 'GENERIC'
+    schema = 'DM'
+    #schema = 'SHARED'
+    sample_size = 1500000
+    full_table_name = db + "." + schema + "." + table 
+    print(table)
+    # Define the SQL query to retrieve table names
+    query = "SELECT * FROM " + db + "." + schema + "." + table + ' limit ' + str(sample_size)
+
+    # Execute the query and store the results in a DataFrame
+    table_detail = pd.read_sql_query(query, con_dev_write)
+
+    # Call function to get the statistics
+    numeric_stats, non_numeric_stats = statistical_profile(table_detail, full_table_name)
+    ##print
+    #print(numeric_stats, non_numeric_stats)
+
+    # Plot histograms for non-numeric columns
+    plot_histograms_for_non_numeric(table_detail.select_dtypes(exclude=['number']))
+    
+    plot_numeric_column_statistics(table_detail.select_dtypes(include=['number']), low_variance_threshold=10)
+    
+    calculate_and_plot_outliers(table_detail.select_dtypes(include=['number']))
+    #outliers_detailed_summary_df
+                                
+    # Set the write date
+    write_date = strftime("%Y-%m-%d-%H-%M", gmtime())
+
+    ## numeric data
+    # Reset the index to turn it into a column
+    numeric_stats_reset = numeric_stats.reset_index()
+
+    # Write the DataFrame to Snowflake
+    numeric_stats_reset['write_date'] = write_date
+    write_pandas(con_dev_write, numeric_stats_reset, "T_DATA_PROFILE_COLUMN_PYTHON", auto_create_table=True, overwrite=False)
+
+    ## NON numeric data
+    # Reset the index to turn it into a column
+    non_numeric_stats_reset = non_numeric_stats.reset_index()
+    non_numeric_stats_reset = non_numeric_stats_reset.astype(str)
+    non_numeric_stats_reset['write_date'] = write_date
+
+    non_numeric_stats_reset.columns = map(lambda x: str(x).upper(), non_numeric_stats_reset.columns)
+
+    # Write the DataFrame to Snowflake
+    write_pandas(con_dev_write, non_numeric_stats_reset, "T_DATA_PROFILE_COLUMN_PYTHON_NON", auto_create_table=True, overwrite=False)
+
+print('complete')
+
+def clean_line(line):
+    return line.encode('ascii', 'ignore').decode('ascii')  # Strips out non-ASCII characters
+
+# Open the file, clean the lines, and then load it into a DataFrame
+with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+    cleaned_lines = [clean_line(line) for line in f]
+    
+# Write the cleaned content to a temporary file or load directly into pandas
+from io import StringIO
+cleaned_file = StringIO('\n'.join(cleaned_lines))
+
+file_path = '/Users/aaronblack/Documents/research/AI_ASSISTED_DATA_PIPE_DELIMITED_TEXT.txt'
+
+# Load the cleaned CSV data into a DataFrame
+#table_detail = pd.read_csv(cleaned_file, nrows=49000,error_bad_lines=False, engine='python')
+
+table_detail = pd.read_csv(file_path, sep='|')
+# Display the first few rows
+#print(table_detail.head())
+print('done')
+
+# Execute the query and store the results in a DataFrame
+#table_detail = pd.read_sql_query(query, con_dev_write)
+full_table_name = 'AI Assisted Report Interpretation Inputs.csv'
+# Call function to get the statistics
+numeric_stats, non_numeric_stats = statistical_profile(table_detail, full_table_name)
+#print(numeric_stats, non_numeric_stats)
+
+# Plot histograms for non-numeric columns
+plot_histograms_for_non_numeric(table_detail.select_dtypes(exclude=['number']))
+
+plot_numeric_column_statistics(table_detail.select_dtypes(include=['number']), low_variance_threshold=10)
+
+calculate_and_plot_outliers(table_detail.select_dtypes(include=['number']))
+#outliers_detailed_summary_df
+
+# Set the write date
+write_date = strftime("%Y-%m-%d-%H-%M", gmtime())
+
+## numeric data
+# Reset the index to turn it into a column
+numeric_stats_reset = numeric_stats.reset_index()
+
+# Write the DataFrame to Snowflake
+numeric_stats_reset['write_date'] = write_date
+#write_pandas(con_dev_write, numeric_stats_reset, "T_DATA_PROFILE_COLUMN_PYTHON", auto_create_table=True, overwrite=False)
+
+## NON numeric data
+# Reset the index to turn it into a column
+non_numeric_stats_reset = non_numeric_stats.reset_index()
+non_numeric_stats_reset = non_numeric_stats_reset.astype(str)
+non_numeric_stats_reset['write_date'] = write_date
+
+non_numeric_stats_reset.columns = map(lambda x: str(x).upper(), non_numeric_stats_reset.columns)
+
+# Write the DataFrame to Snowflake
+#write_pandas(con_dev_write, non_numeric_stats_reset, "T_DATA_PROFILE_COLUMN_PYTHON_NON", auto_create_table=True, overwrite=False)
+
+print('complete')
+
+      
