@@ -1,0 +1,197 @@
+create or replace view DL_RAW_DEV.SHARED.VW_SLIDE_IMAGES(
+	IMAGE_BUSINESS_UNIT,
+	CASE_TYPE,
+	DISTINCT_IMAGES,
+	H_E_IMAGES,
+	ACCESSIONS_MULTIPLE_IMAGES,
+	H_E_IMAGE_DUPLICATES,
+	DISTINCT_TEST_ORDERS,
+	SCAN_YEAR,
+	SCAN_MONTH,
+	SCAN_DATE_ROLLUP,
+	SCAN_TYPE,
+	IMAGE_SIZE_IN_GB,
+	IMAGE_SIZE_IN_GB_H_E_ONLY,
+	AVG_IMAGE_SIZE_IN_GB,
+	AVG_IMAGE_SIZE_IN_GB_H_E_ONLY,
+	SITE_CODE,
+	FILE_EXTENSION,
+	H_E_OR_NOT,
+	IMAGE_DIRECTORY,
+	IMAGE_HOST_NAME,
+	UNIQUE_COLUMN,
+	INSTRUMENT_TYPE,
+	LAST_SCAN_DATE,
+	DISTINCT_CASENO,
+	DISTINCT_H_E_CASENO,
+	DISTINCT_PATIENT,
+	DISTINCT_H_E_PATIENT,
+	DESIGNATOR_CODE
+) as
+--/*
+WITH h_e_images AS (
+    SELECT 
+        IMD.TR_ID AS image_id,
+        ROW_NUMBER() OVER (PARTITION BY IMD.TEST_ORDER_OID ORDER BY IMD.scanned_dts DESC) AS slide_count,
+        IMD.TEST_ORDER_OID AS TEST_ORDERS
+    FROM 
+        DW_CUR_PRD.DM.T_FCT_IMAGE_METADATA IMD	
+    INNER JOIN 
+        DW_CUR_PRD.DW.T_CASE_HUB cf ON cf.id = IMD.case_oid
+    INNER JOIN 
+        dw_cur_prd.dw.t_test_order_hub t_order ON t_order.case = cf.id AND t_order.id = imd.test_order_oid
+    INNER JOIN 
+        dw_cur_prd.dw.t_test_hub test ON test.id = t_order.test
+    WHERE 
+        IMD.image_reconcile_status != 4  -- Ignore Deleted Records
+        AND IFNULL(IMD.Archive_Status, -2) = 0  -- Non Archived Images
+        AND IMD.QC_CHOICE != 'fail'
+        AND test.Test_Code IN ('3186','3059','3186X','3531X','1226X','8009X') -- H&E Images Only
+        AND IMD.IMAGE_DIRECTORY NOT LIKE '%permanent%'  -- Patient Slides never go in Permanent Folder
+        AND IMD.IMAGE_DIRECTORY NOT LIKE '%validation%' -- Patient Slides never go in Validation folders
+)
+SELECT
+    'CLINICAL'                                                                                      AS image_business_unit,
+    ct.case_type_name                                                                               AS case_type,
+    COUNT(DISTINCT IMD.TR_ID)                                                                       AS distinct_images,
+    SUM(CASE WHEN h_e_images.image_id IS NULL THEN 0 ELSE IFNULL(h_e_images.slide_count, 0) END)    AS h_e_images,
+    SUM(CASE WHEN IFNULL(h_e_images.slide_count, 0) > 1 THEN 1 ELSE 0 END)                          AS accessions_multiple_images,
+    SUM(CASE WHEN IFNULL(h_e_images.slide_count, 0) > 1 THEN h_e_images.slide_count - 1 ELSE 0 END) AS H_E_image_duplicates,
+    COUNT(DISTINCT IMD.TEST_ORDER_OID)                                                              AS distinct_test_orders,
+    YEAR(IMD.scanned_dts)                                                                           AS scan_year,
+    MONTH(IMD.scanned_dts)                                                                          AS scan_month,
+    TO_DATE(CONCAT(YEAR(IMD.scanned_dts), '-', MONTH(IMD.scanned_dts), '-01'), 'YYYY-MM-DD')        AS scan_date_rollup,
+    imd.scan_type                                                                                   AS scan_type,
+    SUM(imd.length_in_bytes / 1073741824)                                                           AS image_size_in_gb,
+    SUM(CASE WHEN IFNULL(h_e_images.slide_count, 0) > 0 THEN imd.length_in_bytes / 1073741824 ELSE 0 END) 
+                                                                                                    AS image_size_in_gb_h_e_only,
+    AVG(imd.length_in_bytes / 1073741824)                                                           AS avg_image_size_in_gb,
+    AVG(CASE WHEN h_e_images.slide_count > 1 THEN imd.length_in_bytes / 1073741824 ELSE 0 END)      AS avg_image_size_in_gb_h_e_only,
+    imd.site_code                                                                                   AS site_code,
+    CASE 
+        WHEN CHARINDEX('.', REVERSE(IMD.image_filename)) > 0 THEN REVERSE(LEFT(REVERSE(image_filename), CHARINDEX('.', REVERSE(IMD.image_filename)) - 1))
+        ELSE NULL
+    END                                                                                             AS file_extension,
+    CASE 
+        WHEN h_e_images.image_id IS NULL THEN 'Non-H&E'
+        ELSE 'H&E'
+    END                                                                                             AS h_e_or_not,
+    IMD.image_directory                                                                             AS image_directory,
+    REPLACE(IMD.image_host_name,'\\','')                                                            AS image_host_name,
+    ROW_NUMBER() OVER (ORDER BY 1)                                                                  AS unique_column,
+    CASE 
+        WHEN REGEXP_LIKE(IMD.scan_instrument, '^SS[0-9]{5}$') THEN 'GT450'
+        ELSE 'AT2/Turbo'
+    END                                                                                             AS instrument_type,
+    TO_DATE(MAX(imd.scanned_dts))AS last_scan_date,
+    COUNT(DISTINCT cf.case_no)                                                                      AS distinct_caseno,
+    COUNT(DISTINCT CASE WHEN h_e_images.image_id IS NULL THEN NULL ELSE cf.case_no END)             AS distinct_h_e_caseno,
+    COUNT(DISTINCT acc.patient)                                                                     AS distinct_patient,
+    COUNT(DISTINCT CASE WHEN h_e_images.image_id IS NULL THEN NULL ELSE acc.patient END)            AS distinct_h_e_patient,
+    LEFT(IMD.case_no,3)                                                                             AS designator_code
+FROM 
+    DW_CUR_PRD.DM.T_FCT_IMAGE_METADATA IMD	
+INNER JOIN 
+    DW_CUR_PRD.DW.T_CASE_HUB cf ON cf.id = IMD.case_oid
+INNER JOIN 
+    dw_cur_prd.dw.t_test_order_hub t_order ON t_order.case = cf.id AND t_order.id = imd.test_order_oid
+INNER JOIN 
+    dw_cur_prd.dw.t_accession_hub acc ON acc.id = cf.accession
+INNER JOIN 
+    dw_cur_prd.dw.t_test_hub test ON test.id = t_order.test
+INNER JOIN 
+    DW_CUR_PRD.DW.T_CASE_TYPE_HUB ct ON ct.id = cf.case_type
+LEFT JOIN 
+    h_e_images h_e_images ON h_e_images.image_id = IMD.TR_ID
+
+WHERE 
+    IMD.image_reconcile_status != 4  -- Ignore Deleted Records
+    AND IFNULL(IMD.Archive_Status, -1) = 0  -- Non Archived Images
+    AND IMD.QC_CHOICE != 'fail'  --filter out fails
+    AND IMD.IMAGE_DIRECTORY NOT LIKE '%permanent%'  -- Patient Slides never go in Permanent Folder
+    AND IMD.IMAGE_DIRECTORY NOT LIKE '%validation%' -- Patient Slides never go in Validation folders
+GROUP BY 
+    ct.case_type_name,
+    YEAR(IMD.scanned_dts),
+    MONTH(IMD.scanned_dts),
+    TO_DATE(CONCAT(YEAR(IMD.scanned_dts), '-', MONTH(IMD.scanned_dts), '-01'), 'YYYY-MM-DD'),
+    imd.scan_type,
+    IMD.site_code,
+    CASE 
+        WHEN CHARINDEX('.', REVERSE(IMD.image_filename)) > 0 THEN REVERSE(LEFT(REVERSE(IMD.image_filename), CHARINDEX('.', REVERSE(IMD.image_filename)) - 1))
+        ELSE NULL
+    END,
+    CASE 
+        WHEN h_e_images.image_id IS NULL THEN 'Non-H&E'
+        ELSE 'H&E'
+    END,
+    IMD.image_directory,
+    REPLACE(IMD.image_host_name,'\\','') ,
+    CASE 
+        WHEN REGEXP_LIKE(IMD.scan_instrument, '^SS[0-9]{5}$') THEN 'GT450'
+        ELSE 'AT2/Turbo'
+    END,
+    LEFT(IMD.case_no,3) 
+--/*
+UNION ALL --PHARMA
+--*/
+SELECT
+    'PHARMA'                                                                                          AS image_business_unit,
+    case when LEFT(bp.neoprojectiD,3) = 'PID' THEN 'Pharma Project(PID)' ELSE bp.neoprojectiD END          AS case_type,
+    COUNT(DISTINCT app.U_aperiostatusid)                                                              AS distinct_images,
+    NULL                                                                                              AS h_e_images,
+    NULL                                                                                              AS accessions_multiple_images,
+    NULL                                                                                              AS H_E_image_duplicates,
+    COUNT(DISTINCT  acc.u_accessionid)                                                                AS distinct_test_orders, --change to orders \ accession
+    YEAR(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM')) )                      AS scan_year,
+    MONTH(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM')))                      AS scan_month,
+    TO_DATE(CONCAT(YEAR(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM'))), '-', MONTH(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM'))), '-01'), 'YYYY-MM-DD')                                                  AS scan_date_rollup,
+    NULL                                                                                              AS scan_type,
+    NULL                                                                                              AS image_size_in_gb,
+    NULL                                                                                              AS image_size_in_gb_h_e_only,
+    NULL                                                                                              AS avg_image_size_in_gb,
+    NULL                                                                                              AS avg_image_size_in_gb_h_e_only,
+    app.siteid                                                                                        AS site_code,
+    CASE 
+        WHEN CHARINDEX('.', REVERSE(app.filename)) > 0 THEN REVERSE(LEFT(REVERSE(app.filename), CHARINDEX('.', REVERSE(app.filename)) - 1))
+        ELSE NULL
+    END                                                                                               AS file_extension,
+    NULL                                                                                              AS h_e_or_not,
+    replace(replace(app.filepath ,SPLIT_PART(app.filepath, '\\', 3)  ,'') ,'\\\\\\','\\')             AS image_directory,
+    SPLIT_PART(app.filepath, '\\', 3)                                                                 AS image_host_name,
+    ROW_NUMBER() OVER (ORDER BY 1)                                                                    AS unique_column,
+    CASE 
+        WHEN REGEXP_LIKE(app.scanner, '^SS[0-9]{5}$') THEN 'GT450'
+        ELSE 'AT2/Turbo'
+    END                                                                                               AS instrument_type,
+    MAX(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM')))                        AS last_scan_date,
+    COUNT(DISTINCT acc.u_accessionid)                                                                 AS distinct_caseno,
+    NULL                                                                                              AS distinct_h_e_caseno,
+    COUNT(DISTINCT acc.u_accessionid)                                                                 AS distinct_patient,
+    NULL                                                                                              AS distinct_h_e_patient,
+    NULL                                                                                              AS designator_code
+
+from DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.U_aperiostatus  app
+    inner join DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.s_sample samples--.u_accession acc
+        on app.barcode= samples.s_sampleid
+    inner join DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.u_accession acc
+        on acc.u_accessionid = samples.u_accessionid
+    INNER JOIN DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.u_sponsor client
+            on client.u_sponsorid = acc.clientid 
+    INNER JOIN DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.u_bioprojects bp 
+            ON bp.u_bioprojectsid = acc.bioprojectname
+    LEFT JOIN DL_RAW_ADX_LABVANTAGE8_PRD.LABVANTAGE.U_S3FILEUPLOADSTATUS s3_upload
+        on s3_upload.u_keyID1 = app.U_aperiostatusid
+GROUP BY  case when LEFT(bp.neoprojectiD,3) = 'PID' THEN 'Pharma Project(PID)' ELSE bp.neoprojectiD END 
+ , CASE 
+        WHEN CHARINDEX('.', REVERSE(app.filename)) > 0 THEN REVERSE(LEFT(REVERSE(app.filename), CHARINDEX('.', REVERSE(app.filename)) - 1))
+        ELSE NULL
+    END 
+    , CASE 
+     WHEN REGEXP_LIKE(app.scanner, '^SS[0-9]{5}$') THEN 'GT450'
+      ELSE 'AT2/Turbo' END
+    , YEAR(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM')))    
+    , MONTH(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM')))     
+     ,TO_DATE(CONCAT(YEAR(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM'))), '-', MONTH(TO_DATE(TO_TIMESTAMP(app.scanstarttime , 'MM/DD/YYYY HH12:MI:SS AM'))), '-01'), 'YYYY-MM-DD')  
+     ,app.siteid 
+    , app.filepath;
