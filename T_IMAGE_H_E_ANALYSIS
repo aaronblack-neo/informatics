@@ -1,0 +1,176 @@
+--biomarker
+create or replace TABLE DL_RAW_DEV.SHARED.T_IMAGE_H_E_ANALYSIS (
+"case_type" VARCHAR(500),	 
+"distinct_images" 	BIGINT,
+"H_E_images"	BIGINT,
+"accession_multiple_images"	BIGINT,
+"H_E_image_duplicates"	BIGINT,
+"distinct_test_orders" BIGINT,
+"scan_year"	VARCHAR(10),
+"scan_month"	VARCHAR(10),
+"scan_date_rollup" DATE,
+"scan_type" VARCHAR(30),
+"size_in_gb" BIGINT,
+"size_in_gb_h_e_only" BIGINT,
+"avg_size_in_gb" FLOAT,
+"avg_size_in_gb_h_e_only" FLOAT,
+"site_code" VARCHAR(30),
+"file_extension" VARCHAR(10),
+"h_e_or_not" VARCHAR(10),
+"image_directory" VARCHAR(100),
+"image_host_name" VARCHAR(100),
+"unique_column" VARCHAR(100),
+"scan_instrument_type" VARCHAR(100),
+"last_scan_date" DATE,
+"owkin_count" BIGINT,
+"size_in_gb_okwin_only" BIGINT,
+"distinct_caseno" BIGINT,
+"distinct_h_e_caseno" BIGINT,
+"distinct_patient" BIGINT,
+"distinct_h_e_patient" BIGINT
+);
+
+--select * FROM DL_RAW_DEV.SHARED.T_IMAGE_H_E_ANALYSIS
+TRUNCATE TABLE DL_RAW_DEV.SHARED.T_IMAGE_H_E_ANALYSIS;
+
+--INSERT into DL_RAW_DEV.SHARED.T_IMAGE_H_E_ANALYSIS -- each run for each project will have a record here
+INSERT into DL_RAW_DEV.SHARED.T_IMAGE_H_E_ANALYSIS
+with h_e_images AS (
+select TR_ID as image_id
+, ROW_NUMBER() OVER (PARTITION BY IMD.TEST_ORDER_OID ORDER BY IMD.scanned_dts desc) as slide_count
+, IMD.TEST_ORDER_OID as TEST_ORDERS
+--imd.id as image_metadata_id
+FROM DW_CUR_PRD.DM.T_FCT_IMAGE_METADATA IMD	
+    INNER JOIN DW_CUR_PRD.DW.T_CASE_HUB cf
+      on cf.id = IMD.case_oid
+    INNER JOIN dw_cur_prd.dw.t_test_order_hub t_order
+        on t_order.case = cf.id
+        and t_order.id = imd.test_order_oid
+    INNER JOIN dw_cur_prd.dw.t_test_hub test 
+        on test.id = t_order.test
+where IMD.image_reconcile_status != 4  --Ignore Deleted Records. --3,686,105
+	AND IFNULL(IMD.Archive_Status,-2) = 0  --Non Archived Images. (No Symlinks) - Figure out what to do with these later. --3,359,928
+	AND IMD.QC_CHOICE != 'fail' --3,304,135
+    AND test.Test_Code IN ('3186','3059','3186X','3531X','1226X','8009X')--H&E Images Only 
+	AND IMD.IMAGE_DIRECTORY NOT LIKE '%permanent%'  --Patient Slides never go in Permanent Folder --3,301,000
+	AND IMD.IMAGE_DIRECTORY NOT LIKE '%validation%' --Patient Slides noever go in Validation folders. --3,300,993
+  ) 
+  --, image_data_load as (
+  select 
+     ct.case_type_name as case_type
+     
+    , COUNT(DISTINCT IMD.TR_ID)                                 as distinct_images
+    
+    , SUM(case when h_e_images.image_id IS  NULL THEN 0 
+        ELSE IFNULL(h_e_images.slide_count,0) END)              as h_e_images
+    , SUM(case when IFNULL(h_e_images.slide_count,0) > 1 
+        then 1 else 0 end)                                      as accessions_multiple_images
+    , SUM(case when IFNULL(h_e_images.slide_count,0) > 1 
+        then h_e_images.slide_count- 1 else 0 end)              as H_E_image_duplicates    
+    , COUNT(DISTINCT TEST_ORDER_OID)                            as distinct_test_orders   
+    , YEAR(IMD.scanned_dts)                                     as scan_year
+    , MONTH(IMD.scanned_dts)                                    as scan_month
+    , TO_DATE(CONCAT(YEAR(IMD.scanned_dts) , '-', MONTH(IMD.scanned_dts), '-01'), 'YYYY-MM-DD') 
+                                                                as scan_date_rollup
+    , imd.scan_type                                              as scan_type
+    , SUM(imd.length_in_bytes/1073741824)                        as size_in_gb
+    , SUM(case when IFNULL(h_e_images.slide_count,0) > 0 THEN
+                    imd.length_in_bytes/1073741824  
+                                ELSE 0 END )                    as size_in_gb_h_e_only
+    , AVG(imd.length_in_bytes/1073741824)                        as avg_size_in_gb
+    , AVG(case when h_e_images.slide_count > 1 THEN 
+                            imd.length_in_bytes/1073741824 
+                else 0 end )                                    as avg_size_in_gb_h_e_only
+    , imd.site_code                                             as site_code
+    , CASE 
+        WHEN CHARINDEX('.', REVERSE(image_filename)) > 0 
+            THEN REVERSE(LEFT(REVERSE(image_filename), CHARINDEX('.', REVERSE(image_filename)) - 1))
+        ELSE NULL
+    END                                                         AS file_extension
+    , case when h_e_images.image_id IS  NULL THEN 'Non-H&E'
+    ELSE 'H&E' END                                              AS h_e_or_not
+    , image_directory                                           AS image_directory
+    , image_host_name                                           AS image_host_name
+    , ROW_NUMBER() OVER (ORDER BY 1)                            AS unique_column
+    , CASE 
+        WHEN REGEXP_LIKE(scan_instrument, '^SS[0-9]{5}$') THEN 'GT450'
+        ELSE 'AT2/Turbo'
+    END                                                         AS instrument_type
+    , MAX(imd.scanned_dts)                                      AS last_scan_date
+    , SUM(case when meta.accession_id is null then 0 else 1 end) AS owkin_count
+    , SUM(case when meta.accession_id is null THEN 0
+                                ELSE imd.length_in_bytes/1073741824 END ) 
+                                                                AS size_in_gb_okwin_only
+    , COUNT(DISTINCT cf.case_no )                               as distinct_caseno
+    , COUNT(DISTINCT case when h_e_images.image_id IS  NULL THEN NULL
+    ELSE  cf.case_no END)                                      AS distinct_h_e_caseno
+    , COUNT(DISTINCT acc.patient)                              as distinct_patient
+    , COUNT(DISTINCT case when h_e_images.image_id IS  NULL THEN NULL
+    ELSE  acc.patient END)                                      AS distinct_h_e_patient
+    --5002972
+    --select COUNT(*)    
+FROM DW_CUR_PRD.DM.T_FCT_IMAGE_METADATA IMD	
+    INNER JOIN DW_CUR_PRD.DW.T_CASE_HUB cf
+      on cf.id = IMD.case_oid
+    INNER JOIN dw_cur_prd.dw.t_test_order_hub t_order
+        on t_order.case = cf.id
+        and t_order.id = imd.test_order_oid
+    INNER JOIN dw_cur_prd.dw.t_accession_hub acc
+        on acc.id = cf.accession
+    INNER JOIN dw_cur_prd.dw.t_test_hub test 
+        on test.id = t_order.test
+    INNER JOIN DW_CUR_PRD.DW.T_CASE_TYPE_HUB ct
+        on ct.id = cf.case_type
+    LEFT JOIN h_e_images h_e_images --cte above
+        on h_e_images.image_id = IMD.TR_ID
+--match to metadata file
+    LEFT JOIN nsf_daas_dev.projects.vw_owkin_image_metadata meta
+        on meta.file_location = imd.external_image_path
+WHERE IMD.image_reconcile_status != 4  --Ignore Deleted Records. --3,686,105
+	AND IFNULL(IMD.Archive_Status,-1) = 0  --Non Archived Images. (No Symlinks) - Figure out what to do with these later. --3,359,928
+	AND IMD.QC_CHOICE != 'fail' --3,304,135
+	AND IMD.IMAGE_DIRECTORY NOT LIKE '%permanent%'  --Patient Slides never go in Permanent Folder --3,301,000
+	AND IMD.IMAGE_DIRECTORY NOT LIKE '%validation%' --Patient Slides noever go in Validation folders. --3,300,993
+GROUP BY 
+     ct.case_type_name , YEAR(IMD.scanned_dts)   , MONTH(IMD.scanned_dts) 
+     ,TO_DATE(CONCAT(YEAR(IMD.scanned_dts) , '-', MONTH(IMD.scanned_dts), '-01'), 'YYYY-MM-DD') 
+     , imd.scan_type,site_code
+     , CASE 
+        WHEN CHARINDEX('.', REVERSE(image_filename)) > 0 
+            THEN REVERSE(LEFT(REVERSE(image_filename), CHARINDEX('.', REVERSE(image_filename)) - 1))
+        ELSE NULL
+    END
+    ,case when h_e_images.image_id IS  NULL THEN 'Non-H&E'
+        ELSE 'H&E' END  
+    ,image_directory
+    ,image_host_name
+    , CASE 
+        WHEN REGEXP_LIKE(scan_instrument, '^SS[0-9]{5}$') THEN 'GT450'
+        ELSE 'AT2/Turbo'
+    END  
+ORDER BY 
+      YEAR(IMD.scanned_dts) , (MONTH(IMD.scanned_dts)), ct.case_type_name
+
+
+--select * FROM tbl_numeric_stats_temp 
+--select * FROM tbl_non_numeric_stats_temp
+
+--select COUNT(*)
+ --FROM nsf_daas_dev.projects.vw_owkin_image_metadata_internal md
+ --WHERE md.age_original > 99  or md.age_original < 19
+
+
+ --select COUNT(*)
+ --FROM nsf_daas_dev.projects.vw_owkin_image_metadata_internal md
+ --WHERE md.size_in_gb > 3.1532 
+ --or md.size_in_gb <= 0
+
+ --select *
+ --FROM DW_CUR_PRD.DW.T_IMAGE_METADATA_HUB
+ --limit 100;
+ 
+ 
+
+ 
+ 
+      
