@@ -1,0 +1,531 @@
+/*RaDaR® Post-Launch Ordering Analysis
+  compared against - https://neogenomics.lightning.force.com/lightning/r/Report/00OVs00000IogPtMAJ/view?queryScope=userFolders
+  ======================================
+  Analyzes RaDaR test ordering patterns since the 2026 product launch.
+  Tracks order status for each RaDaR MRD test variant (initial, follow-up, hold),
+  identifies cross-sell opportunities by surfacing non-RaDaR tests ordered by the
+  same patient, and includes tumor/treatment context from clinical intake data.
+
+  REFACTORED: Primary driver is now APVX WORKLISTTABLE instead of GOLD
+  V_GOLD_PANEL_TEST_DETAIL. This ensures accessions that have been ordered but
+  not yet fully accessioned into the GOLD layer are still included. GOLD data
+  is LEFT JOINed for enrichment with COALESCE fallback to APVX worklist fields.
+
+  Tables Used:
+    - DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE              : PRIMARY DRIVER - identifies RaDaR accessions and provides fallback fields
+    - DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL      : Panel/test-level detail (test names, statuses, case numbers) - when available
+    - DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION               : Accession header (created datetime, client link, order type)
+    - DW_ENTERPRISE_PRD.GOLD.V_GOLD_CLIENT                   : Client/account master (name, number)
+    - DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL                    : Panel-level detail (co-ordered panels like NEO PanTracer)
+    - DW_ENTERPRISE_PRD.GOLD.V_GOLD_ORDERING_PROVIDER_PIVOT  : Ordering provider name
+    - DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB                 : Enterprise accession hub (bridges hub ID to APVX source ID)
+    - DW_CUR_PRD.DW.T_ACCESSION_HUB                          : Current accession hub (links accession to patient)
+    - DL_PRP_DEV.REF.V_EDW_APVX_RADAR_CLINICAL_INFORMATION   : RaDaR clinical intake (tumor type, treatment)
+    - DL_RAW_APVX_PRD.ORDERS.ACCESSION                       : Raw APVX accession (links to billing, disease stage, facility)
+    - DL_RAW_APVX_PRD.ORDERS.RADARCLINICALINFO                : RaDaR-specific clinical intake (resection date as diagnosis proxy)
+    - DL_RAW_APVX_PRD.BILLING.BILLTYPE                        : Bill type lookup (client bill, insurance, etc.)
+    - DL_RAW_APVX_PRD.BILLING.DISEASESTAGE                    : Disease stage lookup (0, I, II, III, IIIA, IIIB, IV)
+    - DL_RAW_APVX_PRD.ORDERS.CLIENTSHIPPINGADDRESS             : Client shipping address (city, state, zip)
+    - DL_RAW_APVX_PRD.ORDERS.CLIENT                             : Client master (links CLIENTTYPEID for test/sample exclusion)
+    - DL_RAW_APVX_PRD.ORDERS.CLIENTTYPE                         : Client type lookup (Sample, Proficiency Test, Standard, etc.)
+
+  Output:
+    - DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH : One row per accession with RaDaR order status,
+      cross-sell flags, clinical context, billing type, per-variant workflow step + date,
+      disease stage, resection date, APVX accession ID, order type, ordering provider,
+      co-ordered panels, client location, APVX patient ID,
+      PanTracer panel co-order flag and panel names.
+*/
+TRUNCATE TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
+
+INSERT INTO DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
+
+-- ============================================================
+-- CTE 0: excluded_clients
+-- Dynamically identifies test, sample, proficiency, and other
+-- non-production clients using BOTH the APVX CLIENTTYPE dimension
+-- AND name-pattern matching. This replaces hardcoded client number
+-- exclusions and will automatically catch new test clients.
+-- Exclusion criteria:
+--   1. CLIENTTYPE = 'Sample' or 'Proficiency Test'
+--   2. Client name contains: Test, Sample, QC, Proficiency, Demo,
+--      Validation, Dummy, or equals 'Unknown'
+-- ============================================================
+WITH excluded_clients AS (
+    SELECT DISTINCT c.CLIENTID
+    FROM DL_RAW_APVX_PRD.ORDERS.CLIENT c
+    JOIN DL_RAW_APVX_PRD.ORDERS.CLIENTTYPE ct ON c.CLIENTTYPEID = ct.CLIENTTYPEID
+    WHERE ct.CLIENTTYPENAME IN ('Sample', 'Proficiency Test')
+       OR UPPER(c.CLIENTNAME) LIKE '%TEST%'
+       OR UPPER(c.CLIENTNAME) LIKE '%SAMPLE%'
+       OR UPPER(c.CLIENTNAME) LIKE '%QC %'
+       OR UPPER(c.CLIENTNAME) LIKE '%QUALITY CONTROL%'
+       OR UPPER(c.CLIENTNAME) LIKE '%PROFICIENCY%'
+       OR UPPER(c.CLIENTNAME) LIKE '%DEMO%'
+       OR UPPER(c.CLIENTNAME) LIKE '%VALIDATION%'
+       OR UPPER(c.CLIENTNAME) LIKE '%DUMMY%'
+       OR UPPER(c.CLIENTNAME) = 'UNKNOWN'
+    UNION
+    SELECT DISTINCT wl.CLIENTID
+    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE wl
+    WHERE UPPER(wl.CLIENTNAME) LIKE '%TEST%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%SAMPLE%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%QC %'
+       OR UPPER(wl.CLIENTNAME) LIKE '%QUALITY CONTROL%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%PROFICIENCY%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%DEMO%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%VALIDATION%'
+       OR UPPER(wl.CLIENTNAME) LIKE '%DUMMY%'
+       OR UPPER(wl.CLIENTNAME) = 'UNKNOWN'
+),
+
+-- ============================================================
+-- CTE 1: radar_worklist_base
+-- PRIMARY DRIVER: Identifies all RaDaR accessions from the APVX
+-- worklist since 2026 launch. Aggregates case numbers, client info,
+-- doctor name, and bill type per accession. Includes accessions
+-- not yet propagated to the GOLD layer.
+-- ============================================================
+radar_worklist_base AS (
+    SELECT
+        wl.ACCESSIONID,
+        MIN(wl.CREATEDDATE)::DATE AS WL_ORDER_DATE,
+        MAX(wl.CLIENTNAME) AS WL_CLIENT_NAME,
+        MAX(wl.CLIENTNUMBER) AS WL_CLIENT_NUMBER,
+        MAX(wl.CLIENTSTATE) AS WL_CLIENT_STATE,
+        LISTAGG(DISTINCT wl.CASENO, ', ') WITHIN GROUP (ORDER BY wl.CASENO) AS WL_CASE_NOS,
+        MAX(wl.DOCTORNAME) AS WL_DOCTOR_NAME,
+        MAX(wl.BILLTYPENAME) AS WL_BILL_TYPE_NAME,
+        NULLIF(SPLIT_PART(TRIM(MAX(wl.DOCTORSNPI), '|'), '|', 1), '') AS WL_DOCTOR_NPI
+    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE wl
+    WHERE wl.PANELS_TEXT ILIKE '%Radar%'
+      AND wl.CREATEDDATE >= '2026-01-01'
+      AND wl.CLIENTID NOT IN (SELECT CLIENTID FROM excluded_clients)
+    GROUP BY wl.ACCESSIONID
+),
+
+-- ============================================================
+-- CTE 2: accession_to_patient
+-- Maps every enterprise accession hub ID to a patient hub ID
+-- by bridging through the APVX source accession ID.
+-- Used downstream to find other tests for the same patient.
+-- ============================================================
+accession_to_patient AS (
+    SELECT
+        eah.ID AS ACCESSION_HUB_ID,
+        cah.PATIENT AS PATIENT_HUB_ID
+    FROM DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB eah
+    JOIN DW_CUR_PRD.DW.T_ACCESSION_HUB cah
+        ON eah.ACCESSION_SOURCE_ID = cah.ACCESSION_ID
+),
+
+-- ============================================================
+-- CTE 3: patient_other_tests
+-- For each patient who has a RaDaR accession, aggregates all
+-- non-RaDaR test names ordered across ANY of their accessions
+-- since 2026-01-01.  Supports cross-sell opportunity analysis.
+-- ============================================================
+patient_other_tests AS (
+    SELECT
+        a2p.PATIENT_HUB_ID,
+        rwb.ACCESSIONID AS RADAR_ACCESSIONID,
+        LISTAGG(DISTINCT CASE WHEN ptd2.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd2.MASTER_TEST_ORDERNAME END, '; ')
+            WITHIN GROUP (ORDER BY CASE WHEN ptd2.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd2.MASTER_TEST_ORDERNAME END) AS OTHER_PATIENT_TESTS
+    FROM radar_worklist_base rwb
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub_pt
+        ON SPLIT_PART(hub_pt.ACCESSION_SOURCE_ID, '|', 4)::NUMBER = rwb.ACCESSIONID
+    JOIN accession_to_patient a2p ON hub_pt.ID = a2p.ACCESSION_HUB_ID
+    JOIN accession_to_patient a2p_all ON a2p.PATIENT_HUB_ID = a2p_all.PATIENT_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL ptd2
+        ON a2p_all.ACCESSION_HUB_ID = ptd2.ACCESSION_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION acc2
+        ON ptd2.ACCESSION_HUB_ID = acc2.ACCESSION_HUB_ID
+    WHERE acc2."ACCESSION CREATED DATETIME" >= '2026-01-01'
+    GROUP BY a2p.PATIENT_HUB_ID, rwb.ACCESSIONID
+),
+
+-- ============================================================
+-- CTE 3b: patient_diff_tests
+-- Non-RaDaR test names on DIFFERENT accessions for the same patient.
+-- Excludes tests from the current RaDaR accession itself.
+-- ============================================================
+patient_diff_tests AS (
+    SELECT
+        a2p.PATIENT_HUB_ID,
+        rwb.ACCESSIONID AS RADAR_ACCESSIONID,
+        LISTAGG(DISTINCT CASE WHEN ptd2.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd2.MASTER_TEST_ORDERNAME END, '; ')
+            WITHIN GROUP (ORDER BY CASE WHEN ptd2.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd2.MASTER_TEST_ORDERNAME END) AS DIFF_ACC_TESTS
+    FROM radar_worklist_base rwb
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub_pt
+        ON SPLIT_PART(hub_pt.ACCESSION_SOURCE_ID, '|', 4)::NUMBER = rwb.ACCESSIONID
+    JOIN accession_to_patient a2p ON hub_pt.ID = a2p.ACCESSION_HUB_ID
+    JOIN accession_to_patient a2p_all ON a2p.PATIENT_HUB_ID = a2p_all.PATIENT_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL ptd2
+        ON a2p_all.ACCESSION_HUB_ID = ptd2.ACCESSION_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION acc2
+        ON ptd2.ACCESSION_HUB_ID = acc2.ACCESSION_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub2
+        ON a2p_all.ACCESSION_HUB_ID = hub2.ID
+    WHERE acc2."ACCESSION CREATED DATETIME" >= '2026-01-01'
+      AND SPLIT_PART(hub2.ACCESSION_SOURCE_ID, '|', 4)::NUMBER != rwb.ACCESSIONID
+    GROUP BY a2p.PATIENT_HUB_ID, rwb.ACCESSIONID
+),
+
+-- ============================================================
+-- CTE 3c: patient_diff_panels
+-- Non-RaDaR panel names on DIFFERENT accessions for the same patient.
+-- Excludes panels from the current RaDaR accession itself.
+-- ============================================================
+patient_diff_panels AS (
+    SELECT
+        a2p.PATIENT_HUB_ID,
+        rwb.ACCESSIONID AS RADAR_ACCESSIONID,
+        LISTAGG(DISTINCT p."MASTER PANEL ORDER NAME", '; ')
+            WITHIN GROUP (ORDER BY p."MASTER PANEL ORDER NAME") AS DIFF_ACC_PANELS
+    FROM radar_worklist_base rwb
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub_pt
+        ON SPLIT_PART(hub_pt.ACCESSION_SOURCE_ID, '|', 4)::NUMBER = rwb.ACCESSIONID
+    JOIN accession_to_patient a2p ON hub_pt.ID = a2p.ACCESSION_HUB_ID
+    JOIN accession_to_patient a2p_all ON a2p.PATIENT_HUB_ID = a2p_all.PATIENT_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL p
+        ON a2p_all.ACCESSION_HUB_ID = p.ACCESSION_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION acc2
+        ON p.ACCESSION_HUB_ID = acc2.ACCESSION_HUB_ID
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub2
+        ON a2p_all.ACCESSION_HUB_ID = hub2.ID
+    WHERE acc2."ACCESSION CREATED DATETIME" >= '2026-01-01'
+      AND SPLIT_PART(hub2.ACCESSION_SOURCE_ID, '|', 4)::NUMBER != rwb.ACCESSIONID
+      AND p."MASTER PANEL ORDER NAME" IS NOT NULL
+      AND p."MASTER PANEL ORDER NAME" != ''
+      AND p."MASTER PANEL ORDER NAME" NOT ILIKE '%Radar%'
+    GROUP BY a2p.PATIENT_HUB_ID, rwb.ACCESSIONID
+),
+
+-- ============================================================
+-- CTE 4: radar_workflow_by_variant
+-- Classifies each RaDaR worklist row into one of 4 test variants
+-- based on PANELS_TEXT, then ranks by most recent LASTUPDATED
+-- within each (accession, variant) pair.
+--
+-- PANELS_TEXT patterns:
+--   '(Blood) RaDaR® ST...'                → First Timepoint (Blood)
+--   '...RaDaR ST First Timepoint...'       → First Timepoint
+--   '...Follow-up...'                      → Follow-up Timepoint
+--   '...Process and Hold...'               → Process and Hold
+-- ============================================================
+radar_workflow_by_variant AS (
+    SELECT
+        ACCESSIONID,
+        CASE
+            WHEN PANELS_TEXT ILIKE '%(Blood) RaDaR%'       THEN 'First Timepoint (Blood)'
+            WHEN PANELS_TEXT ILIKE '%First Timepoint%'     THEN 'First Timepoint'
+            WHEN PANELS_TEXT ILIKE '%Follow-up%'           THEN 'Follow-up Timepoint'
+            WHEN PANELS_TEXT ILIKE '%Process and Hold%'    THEN 'Process and Hold'
+        END AS RADAR_VARIANT,
+        WORKFLOWSTEP,
+        LASTUPDATED,
+        ROW_NUMBER() OVER (
+            PARTITION BY ACCESSIONID,
+                CASE
+                    WHEN PANELS_TEXT ILIKE '%(Blood) RaDaR%'       THEN 'First Timepoint (Blood)'
+                    WHEN PANELS_TEXT ILIKE '%First Timepoint%'     THEN 'First Timepoint'
+                    WHEN PANELS_TEXT ILIKE '%Follow-up%'           THEN 'Follow-up Timepoint'
+                    WHEN PANELS_TEXT ILIKE '%Process and Hold%'    THEN 'Process and Hold'
+                END
+            ORDER BY LASTUPDATED DESC
+        ) AS rn
+    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE
+    WHERE PANELS_TEXT ILIKE '%Radar%'
+),
+
+-- ============================================================
+-- CTE 5: latest_radar_workflow
+-- Keeps only the most recently updated row per (accession, variant).
+-- ============================================================
+latest_radar_workflow AS (
+    SELECT ACCESSIONID, RADAR_VARIANT, WORKFLOWSTEP, LASTUPDATED
+    FROM radar_workflow_by_variant
+    WHERE rn = 1
+),
+
+-- ============================================================
+-- CTE 6: accession_panels
+-- Aggregates non-RaDaR panel names per accession from V_GOLD_PANEL.
+-- Captures co-ordered panels like NEO PanTracer on the same case.
+-- ============================================================
+accession_panels AS (
+    SELECT
+        p.ACCESSION_HUB_ID,
+        LISTAGG(DISTINCT p."MASTER PANEL ORDER NAME", '; ')
+            WITHIN GROUP (ORDER BY p."MASTER PANEL ORDER NAME") AS ADDITIONAL_PANELS
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL p
+    WHERE p."MASTER PANEL ORDER NAME" IS NOT NULL
+      AND p."MASTER PANEL ORDER NAME" != ''
+      AND p."MASTER PANEL ORDER NAME" NOT ILIKE '%Radar%'
+    GROUP BY p.ACCESSION_HUB_ID
+),
+
+-- ============================================================
+-- CTE 7: accession_ordering_provider
+-- Deduplicates ordering provider per accession from V_GOLD_ORDERING_PROVIDER_PIVOT.
+-- ============================================================
+accession_ordering_provider AS (
+    SELECT
+        E_ACCESSION AS ACCESSION_HUB_ID,
+        MAX(ORDERING_PRACTITIONER_FULL_NAME) AS ORDERING_PRACTITIONER_FULL_NAME,
+        MAX(ORDERING_PRACTITIONER_NPI) AS ORDERING_PRACTITIONER_NPI
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_ORDERING_PROVIDER_PIVOT
+    GROUP BY E_ACCESSION
+),
+
+-- ============================================================
+-- CTE 8: patient_pantracer
+-- For each APVX patient, aggregates distinct PanTracer panel names
+-- ordered in 2026 from the APVX worklist. Used to flag RaDaR
+-- patients who also have PanTracer orders (cross-sell monitoring).
+-- ============================================================
+patient_pantracer AS (
+    SELECT
+        PATIENTID,
+        LISTAGG(DISTINCT
+            CASE WHEN PANELS_TEXT ILIKE '%PanTracer%'
+                 THEN REGEXP_SUBSTR(PANELS_TEXT, 'NEO PanTracer[^`]*')
+            END, '; ')
+            WITHIN GROUP (ORDER BY
+            CASE WHEN PANELS_TEXT ILIKE '%PanTracer%'
+                 THEN REGEXP_SUBSTR(PANELS_TEXT, 'NEO PanTracer[^`]*')
+            END) AS PANTRACER_PANEL_NAMES
+    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE wl_pt
+    WHERE wl_pt.PANELS_TEXT ILIKE '%PanTracer%'
+      AND wl_pt.CREATEDDATE >= '2026-01-01'
+      AND wl_pt.CLIENTID NOT IN (SELECT CLIENTID FROM excluded_clients)
+    GROUP BY wl_pt.PATIENTID
+),
+
+-- ============================================================
+-- CTE 9: gold_test_detail
+-- Pre-aggregates GOLD panel test detail per accession hub ID.
+-- Only populated for accessions that have made it to the GOLD layer.
+-- ============================================================
+gold_test_detail AS (
+    SELECT
+        ptd.ACCESSION_HUB_ID,
+        MAX(CASE WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST First Timepoint'
+            THEN ptd.SOURCE_TESTORDERSTATUS END) AS STATUS_FIRST_TIMEPOINT,
+        MAX(CASE WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST First Timepoint (Blood)'
+            THEN ptd.SOURCE_TESTORDERSTATUS END) AS STATUS_FIRST_TIMEPOINT_BLOOD,
+        MAX(CASE WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST Follow-up Timepoint'
+            THEN ptd.SOURCE_TESTORDERSTATUS END) AS STATUS_FOLLOWUP,
+        MAX(CASE WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® Process and Hold'
+            THEN ptd.SOURCE_TESTORDERSTATUS END) AS STATUS_PROCESS_HOLD,
+        CASE WHEN MAX(CASE WHEN ptd.MASTER_TEST_ORDERNAME IN (
+                'RaDaR® ST First Timepoint', 'RaDaR® ST First Timepoint (Blood)'
+            ) THEN 1 END) = 1 THEN 1 ELSE 0 END AS IS_FIRST_TIMEPOINT,
+        LISTAGG(DISTINCT CASE WHEN ptd.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd.MASTER_TEST_ORDERNAME END, '; ')
+            WITHIN GROUP (ORDER BY CASE WHEN ptd.MASTER_TEST_ORDERNAME NOT ILIKE '%Radar%'
+            THEN ptd.MASTER_TEST_ORDERNAME END) AS ADDITIONAL_TESTS,
+        LISTAGG(DISTINCT ptd.CASENO, ', ') WITHIN GROUP (ORDER BY ptd.CASENO) AS GOLD_CASE_NOS
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL ptd
+    WHERE ptd.MASTER_TEST_ORDERNAME IS NOT NULL
+    GROUP BY ptd.ACCESSION_HUB_ID
+)
+
+-- ============================================================
+-- Main SELECT: one row per APVX accession
+-- Driven by APVX worklist (radar_worklist_base). LEFT JOINs to
+-- GOLD for enrichment with COALESCE fallbacks to APVX worklist.
+-- ============================================================
+SELECT
+    COALESCE(acc."ACCESSION CREATED DATETIME"::DATE, rwb.WL_ORDER_DATE) AS ORDER_DATE,
+    COALESCE(cl.CLIENT_NAME, rwb.WL_CLIENT_NAME) AS CLIENT_NAME,
+
+    -- RaDaR test variant statuses (from GOLD when available, else workflow step from APVX)
+    COALESCE(gtd.STATUS_FIRST_TIMEPOINT,
+        MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint' THEN lrw.WORKFLOWSTEP END)
+    ) AS "RaDaR ST First Timepoint",
+    COALESCE(gtd.STATUS_FIRST_TIMEPOINT_BLOOD,
+        MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint (Blood)' THEN lrw.WORKFLOWSTEP END)
+    ) AS "RaDaR ST First Timepoint (Blood)",
+    COALESCE(gtd.STATUS_FOLLOWUP,
+        MAX(CASE WHEN lrw.RADAR_VARIANT = 'Follow-up Timepoint' THEN lrw.WORKFLOWSTEP END)
+    ) AS "RaDaR ST Follow-up Timepoint",
+    COALESCE(gtd.STATUS_PROCESS_HOLD,
+        MAX(CASE WHEN lrw.RADAR_VARIANT = 'Process and Hold' THEN lrw.WORKFLOWSTEP END)
+    ) AS "RaDaR Process and Hold",
+
+    -- Flag: 1 if accession includes an initial (first timepoint) order
+    CASE WHEN COALESCE(gtd.IS_FIRST_TIMEPOINT, 0) = 1
+         OR MAX(CASE WHEN lrw.RADAR_VARIANT IN ('First Timepoint', 'First Timepoint (Blood)') THEN 1 END) = 1
+         THEN 1 ELSE 0 END AS "Is First Timepoint",
+
+    -- Non-RaDaR tests on the SAME accession (from GOLD when available)
+    gtd.ADDITIONAL_TESTS AS "Additional Panels / Tests",
+
+    -- Non-RaDaR tests across ALL accessions for the same patient (broader cross-sell)
+    MAX(pot.OTHER_PATIENT_TESTS) AS "Other Patient Tests (Across Accessions)",
+
+    -- Flag: 1 if the patient has any non-RaDaR tests across any accession
+    CASE WHEN MAX(pot.OTHER_PATIENT_TESTS) IS NOT NULL AND MAX(pot.OTHER_PATIENT_TESTS) != ''
+        THEN 1 ELSE 0 END AS "Has Other Tests",
+
+    -- Clinical intake data from RaDaR requisition form
+    MAX(rci.TUMORTYPENAME) AS TUMORTYPENAME,
+    MAX(rci.TUMORSUBTYPENAME) AS TUMORSUBTYPENAME,
+    MAX(rci.OTHERTUMORTYPEVALUE) AS OTHERTUMORTYPEVALUE,
+    MAX(rci.TREATMENTNAME) AS TREATMENTNAME,
+    MAX(rci.TUMORTYPE_EXPRESSION) AS TUMORTYPE_EXPRESSION,
+    MAX(rci.TREATMENT_TYPE_LIST) AS TREATMENT_TYPE_LIST,
+
+    -- Accession identifiers
+    hub.ID AS ACCESSION_HUB_ID,
+    COALESCE(gtd.GOLD_CASE_NOS, rwb.WL_CASE_NOS) AS CASE_NOS,
+    COALESCE(cl.CLIENT_NUMBER, rwb.WL_CLIENT_NUMBER) AS CLIENT_NUMBER,
+
+    -- Billing (GOLD lookup preferred, APVX worklist fallback)
+    COALESCE(MAX(bt.BILLTYPENAME), rwb.WL_BILL_TYPE_NAME) AS BILLTYPENAME,
+
+    -- Per-variant workflow step and date (from WORKLISTTABLE, RaDaR cases only)
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint'         THEN lrw.WORKFLOWSTEP END) AS "WF Step: First Timepoint",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint'         THEN lrw.LASTUPDATED END)::DATE AS "WF Date: First Timepoint",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint (Blood)' THEN lrw.WORKFLOWSTEP END) AS "WF Step: First Timepoint (Blood)",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'First Timepoint (Blood)' THEN lrw.LASTUPDATED END)::DATE AS "WF Date: First Timepoint (Blood)",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'Follow-up Timepoint'     THEN lrw.WORKFLOWSTEP END) AS "WF Step: Follow-up Timepoint",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'Follow-up Timepoint'     THEN lrw.LASTUPDATED END)::DATE AS "WF Date: Follow-up Timepoint",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'Process and Hold'        THEN lrw.WORKFLOWSTEP END) AS "WF Step: Process and Hold",
+    MAX(CASE WHEN lrw.RADAR_VARIANT = 'Process and Hold'        THEN lrw.LASTUPDATED END)::DATE AS "WF Date: Process and Hold",
+
+    -- Disease stage (from APVX accession → DISEASESTAGE lookup)
+    MAX(ds.STAGENAME) AS "Disease Stage",
+    -- Resection date (proxy for date of diagnosis)
+    MAX(radar_clin.RESECTIONDATE)::DATE AS "Resection Date",
+
+    -- Original NeoLINK/APVX accession ID
+    rwb.ACCESSIONID AS APVX_ACCESSION_ID,
+
+    -- Order entry method (Paper TRF, Interface/EMR, online order, COVID)
+    COALESCE(MAX(acc."ACCESSION ORDER TYPE"), MAX(hub.ACCESSION_ORDER_TYPE)) AS ACCESSION_ORDER_TYPE,
+
+    -- Ordering provider (GOLD preferred, APVX worklist fallback)
+    COALESCE(MAX(op.ORDERING_PRACTITIONER_FULL_NAME), rwb.WL_DOCTOR_NAME) AS ORDERING_PRACTITIONER_FULL_NAME,
+
+    -- Non-RaDaR panels on the same accession (e.g., NEO PanTracer)
+    MAX(ap.ADDITIONAL_PANELS) AS "Additional Panels",
+
+    -- Client location (city, state, zip from default shipping address)
+    MAX(csa.CITY) AS CLIENT_CITY,
+    MAX(csa.STATEPROVINCE) AS CLIENT_STATE,
+    MAX(csa.POSTALCODE) AS CLIENT_ZIP,
+
+    -- Original NeoLINK/APVX patient ID
+    MAX(apvx_acc.PATIENTID) AS APVX_PATIENT_ID,
+
+    -- PanTracer co-order: panel names and binary flag for same patient in 2026
+    MAX(ppt.PANTRACER_PANEL_NAMES) AS PANTRACER_PANEL_NAME,
+    CASE WHEN MAX(ppt.PANTRACER_PANEL_NAMES) IS NOT NULL THEN 1 ELSE 0 END AS HAS_PANTRACER,
+
+    -- Portfolio: same-accession panels flag
+    CASE WHEN MAX(ap.ADDITIONAL_PANELS) IS NOT NULL THEN 1 ELSE 0 END AS HAS_PANELS_SAME_ACCESSION,
+
+    -- Portfolio: different-accession tests flag
+    CASE WHEN MAX(pdt.DIFF_ACC_TESTS) IS NOT NULL THEN 1 ELSE 0 END AS HAS_TESTS_DIFF_ACCESSION,
+
+    -- Portfolio: different-accession panels flag
+    CASE WHEN MAX(pdp.DIFF_ACC_PANELS) IS NOT NULL THEN 1 ELSE 0 END AS HAS_PANELS_DIFF_ACCESSION,
+
+    -- Portfolio: same-accession tests flag
+    CASE WHEN gtd.ADDITIONAL_TESTS IS NOT NULL AND gtd.ADDITIONAL_TESTS != '' THEN 1 ELSE 0 END AS HAS_TESTS_SAME_ACCESSION,
+
+    -- Portfolio: non-RaDaR tests on different accessions for same patient
+    MAX(pdt.DIFF_ACC_TESTS) AS TESTS_DIFF_ACCESSION,
+
+    -- Portfolio: non-RaDaR panels on different accessions for same patient
+    MAX(pdp.DIFF_ACC_PANELS) AS PANELS_DIFF_ACCESSION,
+
+    -- Summary flag: 1 if ANY non-RaDaR test or panel was ordered (same or different accession)
+    CASE WHEN COALESCE(
+        CASE WHEN gtd.ADDITIONAL_TESTS IS NOT NULL AND gtd.ADDITIONAL_TESTS != '' THEN 1 END,
+        CASE WHEN MAX(ap.ADDITIONAL_PANELS) IS NOT NULL THEN 1 END,
+        CASE WHEN MAX(pdt.DIFF_ACC_TESTS) IS NOT NULL THEN 1 END,
+        CASE WHEN MAX(pdp.DIFF_ACC_PANELS) IS NOT NULL THEN 1 END,
+        CASE WHEN MAX(ppt.PANTRACER_PANEL_NAMES) IS NOT NULL THEN 1 END,
+        0) >= 1 THEN 1 ELSE 0 END AS HAS_ANY_ADDITIONAL_ORDER,
+
+    -- Ordering provider NPI (GOLD preferred, APVX worklist fallback with pipe-stripping)
+    COALESCE(MAX(op.ORDERING_PRACTITIONER_NPI), rwb.WL_DOCTOR_NPI) AS ORDERING_PROVIDER_NPI
+
+-- PRIMARY DRIVER: APVX worklist RaDaR accessions
+FROM radar_worklist_base rwb
+-- Bridge to enterprise accession hub for hub ID and GOLD layer joins
+LEFT JOIN DW_ENTERPRISE_PRD.DW.T_E_ACCESSION_HUB hub
+    ON SPLIT_PART(hub.ACCESSION_SOURCE_ID, '|', 4)::NUMBER = rwb.ACCESSIONID
+-- GOLD accession header (may not exist for recent orders)
+LEFT JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION acc
+    ON hub.ID = acc.ACCESSION_HUB_ID
+-- GOLD client master (may not exist for recent orders)
+LEFT JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_CLIENT cl
+    ON acc.MASTER_CLIENT_HUB_ID = cl.MASTER_CLIENT_HUB_ID
+-- GOLD pre-aggregated test detail (may not exist for recent orders)
+LEFT JOIN gold_test_detail gtd
+    ON hub.ID = gtd.ACCESSION_HUB_ID
+-- RaDaR clinical intake data (tumor, treatment)
+LEFT JOIN DL_PRP_DEV.REF.V_EDW_APVX_RADAR_CLINICAL_INFORMATION rci
+    ON rwb.ACCESSIONID = rci.ACCESSIONID
+-- Patient linkage for cross-sell analysis
+LEFT JOIN accession_to_patient a2p
+    ON hub.ID = a2p.ACCESSION_HUB_ID
+LEFT JOIN patient_other_tests pot
+    ON a2p.PATIENT_HUB_ID = pot.PATIENT_HUB_ID AND rwb.ACCESSIONID = pot.RADAR_ACCESSIONID
+-- Non-RaDaR tests on different accessions for same patient
+LEFT JOIN patient_diff_tests pdt
+    ON a2p.PATIENT_HUB_ID = pdt.PATIENT_HUB_ID AND rwb.ACCESSIONID = pdt.RADAR_ACCESSIONID
+-- Non-RaDaR panels on different accessions for same patient
+LEFT JOIN patient_diff_panels pdp
+    ON a2p.PATIENT_HUB_ID = pdp.PATIENT_HUB_ID AND rwb.ACCESSIONID = pdp.RADAR_ACCESSIONID
+-- Raw APVX accession for billing type, disease stage, facility link
+LEFT JOIN DL_RAW_APVX_PRD.ORDERS.ACCESSION apvx_acc
+    ON rwb.ACCESSIONID = apvx_acc.ACCESSIONID
+LEFT JOIN DL_RAW_APVX_PRD.BILLING.BILLTYPE bt
+    ON apvx_acc.BILLTYPEID = bt.BILLTYPEID
+-- Disease stage lookup (0, I, II, III, IIIA, IIIB, IV)
+LEFT JOIN DL_RAW_APVX_PRD.BILLING.DISEASESTAGE ds
+    ON apvx_acc.DISEASESTAGEID = ds.DISEASESTAGEID
+-- RaDaR clinical intake for resection date
+LEFT JOIN DL_RAW_APVX_PRD.ORDERS.RADARCLINICALINFO radar_clin
+    ON rwb.ACCESSIONID = radar_clin.ACCESSIONID
+-- Per-variant RaDaR workflow steps
+LEFT JOIN latest_radar_workflow lrw
+    ON rwb.ACCESSIONID = lrw.ACCESSIONID
+-- Ordering provider (GOLD, deduplicated via CTE)
+LEFT JOIN accession_ordering_provider op
+    ON hub.ID = op.ACCESSION_HUB_ID
+-- Non-RaDaR panels on the same accession (e.g., NEO PanTracer)
+LEFT JOIN accession_panels ap
+    ON hub.ID = ap.ACCESSION_HUB_ID
+-- Client shipping address (city, state, zip)
+LEFT JOIN DL_RAW_APVX_PRD.ORDERS.CLIENTSHIPPINGADDRESS csa
+    ON apvx_acc.FACILITYID = csa.CLIENTID
+    AND csa."DEFAULT" = TRUE
+    AND csa.ACTIVE = TRUE
+-- PanTracer co-order lookup for same patient in 2026
+LEFT JOIN patient_pantracer ppt
+    ON apvx_acc.PATIENTID = ppt.PATIENTID
+
+-- One row per accession
+GROUP BY rwb.ACCESSIONID, rwb.WL_ORDER_DATE, rwb.WL_CLIENT_NAME, rwb.WL_CLIENT_NUMBER,
+         rwb.WL_CLIENT_STATE, rwb.WL_CASE_NOS, rwb.WL_DOCTOR_NAME, rwb.WL_BILL_TYPE_NAME,
+         rwb.WL_DOCTOR_NPI,
+         hub.ID, hub.ACCESSION_SOURCE_ID,
+         acc."ACCESSION CREATED DATETIME", cl.CLIENT_NAME, cl.CLIENT_NUMBER,
+         gtd.STATUS_FIRST_TIMEPOINT, gtd.STATUS_FIRST_TIMEPOINT_BLOOD,
+         gtd.STATUS_FOLLOWUP, gtd.STATUS_PROCESS_HOLD,
+         gtd.IS_FIRST_TIMEPOINT, gtd.ADDITIONAL_TESTS, gtd.GOLD_CASE_NOS;
+
+
+ 
+--select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
+
