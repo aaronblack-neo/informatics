@@ -8,7 +8,8 @@
     Produces a single-row-per-accession dataset of all RaDaR® ST orders since
     the January 2026 product launch. Supports post-launch commercial monitoring
     including: order velocity, variant mix, cross-sell opportunity identification,
-    clinical context analysis, workflow progression tracking, and specimen receipt timing.
+    clinical context analysis, workflow progression tracking, specimen receipt timing,
+    TAT metrics, QNS/TNP incident tracking, and incident analytics.
 
   GRAIN: One row per ACCESSION_HUB_ID (enterprise accession with at least one
          RaDaR® ST test ordered since 2026-01-01).
@@ -19,19 +20,21 @@
       - Provides order statuses (ORDERED/CANCELLED), co-ordered test names, case numbers
       - Known gap: ~24-48 hour propagation lag for brand-new orders vs raw WORKLISTTABLE
 
-    Gold layer (89% of output columns — 55/62):
+    Gold layer (86% of output columns — 62/72):
       - V_GOLD_PANEL_TEST_DETAIL         : RaDaR test identification, variant statuses, additional tests
       - V_GOLD_ACCESSION                 : Order date, order type, bill type, disease stage, patient linkage
       - V_GOLD_CLIENT                    : Client name, number, city, state, zip, type-based exclusion
-      - V_GOLD_CASE                      : Per-variant workflow date, reported date, current status derivation
+      - V_GOLD_CASE                      : Per-variant workflow date, reported date/TS, current status derivation
       - V_GOLD_PANEL                     : Co-ordered panels (same accession + cross-accession)
       - V_GOLD_ORDERING_PROVIDER_PIVOT   : Ordering provider name and NPI
       - V_GOLD_RADAR_CLINICAL_INFORMATION: Tumor type, subtype, treatment, resection date, receiving facility
       - V_GOLD_RADAR_ORDER_OPTIONS       : Blood collection plan, cadence, test count, reminder intervals
                                            (populated for First Timepoint orders only — 100% for those, 0% for Follow-ups by design)
+      - V_GOLD_INCIDENT                  : QNS/TNP incidents (type, status, variant, created date),
+                                           all incident types list + count per accession
       - T_E_LAB_ORDER_GROUP_HUB         : Bridge from radar order options to accession hub ID
 
-    Silver + Raw layer (11% of output columns — 7/62):
+    Silver + Raw layer (14% of output columns — 10/72):
       - DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE :
           1. WF_STEP_* (4 cols): Granular workflow step name per variant
              (Complete, Molecular Hold, Specimen in Transit, Cancelled, Molecular Tech, etc.)
@@ -39,9 +42,10 @@
           2. PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): PanTracer panel detection via
              PANELS_TEXT regex. PanTracer panels are not yet surfaced in Gold panel views.
       - DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB + T_M_SPECIMEN_TYPE_HUB (Silver):
-          Specimen type filter (blood/peripheral blood) and accession linkage.
+          Specimen type filter (blood/tissue) and accession linkage.
       - DL_RAW_APVX_PRD.ORDERS.SPECIMEN (Raw):
-          RECEIVEDDATE for first blood specimen received (1 col). Not in Gold.
+          RECEIVEDDATE timestamps for specimen receipt (2 cols: blood + tissue).
+          Used in TAT_DAYS, DAYS_IN_LAB, DAYS_TISSUE_TO_BLOOD, DAYS_TO_QNS_TNP metrics.
       - DL_RAW_APVX_PRD.ORDERS.CLIENT + CLIENTTYPE :
           APVX CLIENTID-level exclusion for PanTracer CTE (mirrors Gold name-pattern exclusion).
 
@@ -52,7 +56,7 @@
     Catches ~15 more clients than type-only filtering.
 
   OUTPUT:
-    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (62 columns)
+    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (72 columns)
     Column groups:
       [1-2]   Order metadata: date, client name
       [3-7]   RaDaR variant statuses + first timepoint flag
@@ -70,13 +74,17 @@
       [50-52] Derived: TEST_TYPE, OVERALL_STATUS, PATIENT_ORDER_PROGRESSION
       [53-58] RaDaR order options: blood plan, cadence, test count, reminder, clinician/neo intervals
       [59]    Receiving facility
-      [60-61] Case lifecycle: REPORTED_DATE (first case signout), CURRENT_STATUS (Ordered/In Progress/Reported/Cancelled)
-      [62]    Specimen: FIRST_BLOOD_RECEIVED_DATE (first blood specimen received at lab)
+      [60-61] Case lifecycle: REPORTED_DATE, CURRENT_STATUS (Ordered/In Progress/Reported/Cancelled)
+      [62-63] Specimen receipt: FIRST_BLOOD_RECEIVED_DATE, FIRST_TISSUE_RECEIVED_DATE
+      [64-66] TAT metrics: TAT_DAYS (tissue→report), DAYS_IN_LAB (blood→today if unreported), DAYS_TISSUE_TO_BLOOD
+      [67-69] QNS/TNP: HAS_QNS_TNP flag, QNS_TNP_STATUS, QNS_TNP_VARIANT
+      [70-72] Incidents: INCIDENT_TYPES_LIST, INCIDENT_COUNT, DAYS_TO_QNS_TNP (tissue→first QNS incident)
 
   REMAINING GOLD GAPS (backlog):
     - WF_STEP_* (4 cols): Need V_GOLD_CASE to expose granular lab workflow step names
     - PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): Need PanTracer in V_GOLD_PANEL or dedicated view
-    - FIRST_BLOOD_RECEIVED_DATE (1 col): Need specimen received date in a Gold specimen view
+    - Specimen received timestamps (2 cols): Need Gold specimen view with RECEIVEDDATE
+    - TAT/metric columns (4 cols): Derived from above — would become Gold once specimen dates are in Gold
 */
 
 --select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
@@ -194,6 +202,7 @@ radar_case_workflow AS (
         ptd.MASTER_TEST_ORDERNAME,
         gc."CASE WORKLIST LAST COMPLETED DATETIME"::DATE AS WF_DATE,
         gc."CASE FIRST COMPLETED DATETIME"::DATE AS REPORTED_DATE,
+        gc."CASE FIRST COMPLETED DATETIME" AS REPORTED_TS,
         CASE
             WHEN gc."CASE ORDER STATUS" = 'CANCELLED' THEN 'Cancelled'
             WHEN gc."CASE FIRST COMPLETED DATETIME" IS NOT NULL THEN 'Reported'
@@ -426,7 +435,8 @@ radar_order_options AS (
 blood_specimen_received AS (
     SELECT
         sp.E_ACCESSION AS ACCESSION_HUB_ID,
-        MIN(apvx_sp.RECEIVEDDATE)::DATE AS FIRST_BLOOD_RECEIVED_DATE
+        MIN(apvx_sp.RECEIVEDDATE)::DATE AS FIRST_BLOOD_RECEIVED_DATE,
+        MIN(apvx_sp.RECEIVEDDATE) AS FIRST_BLOOD_RECEIVED_TS
     FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
     JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
     JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMEN apvx_sp
@@ -434,10 +444,69 @@ blood_specimen_received AS (
     WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%blood%'
        OR stype.SPECIMEN_TYPE_NAME ILIKE '%peripheral%'
     GROUP BY sp.E_ACCESSION
+),
+
+-- ============================================================
+-- CTE 15: tissue_specimen_received [SILVER + RAW]
+-- First tissue specimen received date per accession.
+-- Tissue only present on First Timepoint orders (99% coverage
+-- for those, 0% for Follow-ups — by design, tissue is required
+-- for initial tumor panel build only).
+-- ============================================================
+tissue_specimen_received AS (
+    SELECT
+        sp.E_ACCESSION AS ACCESSION_HUB_ID,
+        MIN(apvx_sp.RECEIVEDDATE)::DATE AS FIRST_TISSUE_RECEIVED_DATE,
+        MIN(apvx_sp.RECEIVEDDATE) AS FIRST_TISSUE_RECEIVED_TS
+    FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
+    JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
+    JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMEN apvx_sp
+        ON apvx_sp.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER
+    WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%'
+    GROUP BY sp.E_ACCESSION
+),
+
+-- ============================================================
+-- CTE 16: qns_tnp_incidents [GOLD]
+-- QNS (Quantity Not Sufficient) / TNP (Test Not Performed)
+-- incidents per accession from V_GOLD_INCIDENT.
+-- Aggregates to one row per accession with status and affected variant.
+-- Includes earliest QNS/TNP created date for days-to-QNS metric.
+-- ============================================================
+qns_tnp_incidents AS (
+    SELECT
+        gi.ACCESSION_HUB_ID,
+        1 AS HAS_QNS_TNP,
+        LISTAGG(DISTINCT gi.STATUS, '; ') WITHIN GROUP (ORDER BY gi.STATUS) AS QNS_TNP_STATUS,
+        LISTAGG(DISTINCT gi.INCIDENT_SUB_TYPE, '; ') WITHIN GROUP (ORDER BY gi.INCIDENT_SUB_TYPE) AS QNS_TNP_VARIANT,
+        MIN(gi.CREATED_TIMESTAMP) AS FIRST_QNS_TNP_TS
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_INCIDENT gi
+    WHERE gi.INCIDENT_TYPE = 'QNS/TNP'
+    GROUP BY gi.ACCESSION_HUB_ID
+),
+
+-- ============================================================
+-- CTE 17: all_incidents [GOLD]
+-- All incident types per accession from V_GOLD_INCIDENT.
+-- Provides delimited list of types and distinct count.
+-- ============================================================
+all_incidents AS (
+    SELECT
+        gi.ACCESSION_HUB_ID,
+        LISTAGG(DISTINCT gi.INCIDENT_TYPE, '; ') WITHIN GROUP (ORDER BY gi.INCIDENT_TYPE) AS INCIDENT_TYPES_LIST,
+        COUNT(DISTINCT gi.INCIDENT_HUB_ID) AS INCIDENT_COUNT
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_INCIDENT gi
+    WHERE gi.INCIDENT_TYPE IS NOT NULL AND gi.INCIDENT_TYPE != ''
+    GROUP BY gi.ACCESSION_HUB_ID
 )
 
 -- ============================================================
--- Main SELECT: one row per RaDaR accession (59 columns)
+-- Main SELECT: one row per RaDaR accession (69 columns)
 -- Column order matches T_RADAR_ST_POST_LAUNCH DDL.
 -- Window functions (ROW_NUMBER, COUNT) compute after GROUP BY.
 -- ============================================================
@@ -519,7 +588,25 @@ SELECT
         WHEN MAX(CASE WHEN rcw.CURRENT_STATUS = 'In Progress' THEN 1 END) = 1 THEN 'In Progress'
         ELSE 'Ordered'
     END AS CURRENT_STATUS,
-    bsr.FIRST_BLOOD_RECEIVED_DATE
+    bsr.FIRST_BLOOD_RECEIVED_DATE,
+    tsr.FIRST_TISSUE_RECEIVED_DATE,
+    CASE WHEN MAX(rcw.REPORTED_TS) IS NOT NULL AND tsr.FIRST_TISSUE_RECEIVED_TS IS NOT NULL
+         THEN ROUND(DATEDIFF('hour', tsr.FIRST_TISSUE_RECEIVED_TS, MAX(rcw.REPORTED_TS)) / 24.0, 1)
+    END AS TAT_DAYS,
+    CASE WHEN MAX(rcw.REPORTED_DATE) IS NULL AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
+         THEN ROUND(DATEDIFF('hour', bsr.FIRST_BLOOD_RECEIVED_TS, CURRENT_TIMESTAMP()) / 24.0, 1)
+    END AS DAYS_IN_LAB,
+    CASE WHEN tsr.FIRST_TISSUE_RECEIVED_TS IS NOT NULL AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
+         THEN ROUND(DATEDIFF('hour', tsr.FIRST_TISSUE_RECEIVED_TS, bsr.FIRST_BLOOD_RECEIVED_TS) / 24.0, 1)
+    END AS DAYS_TISSUE_TO_BLOOD,
+    COALESCE(qns.HAS_QNS_TNP, 0) AS HAS_QNS_TNP,
+    qns.QNS_TNP_STATUS,
+    qns.QNS_TNP_VARIANT,
+    ai.INCIDENT_TYPES_LIST,
+    COALESCE(ai.INCIDENT_COUNT, 0) AS INCIDENT_COUNT,
+    CASE WHEN qns.FIRST_QNS_TNP_TS IS NOT NULL AND tsr.FIRST_TISSUE_RECEIVED_TS IS NOT NULL
+         THEN ROUND(DATEDIFF('hour', tsr.FIRST_TISSUE_RECEIVED_TS, qns.FIRST_QNS_TNP_TS) / 24.0, 1)
+    END AS DAYS_TO_QNS_TNP
 FROM radar_accessions ra
 LEFT JOIN client_info ci
     ON ci.MASTER_CLIENT_HUB_ID = ra.MASTER_CLIENT_HUB_ID
@@ -545,6 +632,12 @@ LEFT JOIN radar_order_options roo
     ON roo.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 LEFT JOIN blood_specimen_received bsr
     ON bsr.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
+LEFT JOIN tissue_specimen_received tsr
+    ON tsr.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
+LEFT JOIN qns_tnp_incidents qns
+    ON qns.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
+LEFT JOIN all_incidents ai
+    ON ai.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 GROUP BY
     ra.ORDER_DATE, ci.CLIENT_NAME,
     ra.RADAR_STATUS_FIRST_TIMEPOINT, ra.RADAR_STATUS_FIRST_TIMEPOINT_BLOOD,
@@ -561,7 +654,10 @@ GROUP BY
     op.ORDERING_PROVIDER_NPI, ra.E_PATIENT_HUB_ID,
     roo.BLOOD_COLLECTION_PLAN, roo.BLOOD_TESTING_CADENCE, roo.BLOOD_TEST_COUNT,
     roo.REMINDER_REQUEST, roo.CLINICIAN_DIRECTED_INTERVALS, roo.NEO_MANAGED_INTERVALS,
-    rc.RECEIVING_FACILITY, bsr.FIRST_BLOOD_RECEIVED_DATE;
+    rc.RECEIVING_FACILITY, bsr.FIRST_BLOOD_RECEIVED_DATE, bsr.FIRST_BLOOD_RECEIVED_TS,
+    tsr.FIRST_TISSUE_RECEIVED_DATE, tsr.FIRST_TISSUE_RECEIVED_TS,
+    qns.HAS_QNS_TNP, qns.QNS_TNP_STATUS, qns.QNS_TNP_VARIANT, qns.FIRST_QNS_TNP_TS,
+    ai.INCIDENT_TYPES_LIST, ai.INCIDENT_COUNT;
 
 
 
