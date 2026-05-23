@@ -9,7 +9,8 @@
     the January 2026 product launch. Supports post-launch commercial monitoring
     including: order velocity, variant mix, cross-sell opportunity identification,
     clinical context analysis, workflow progression tracking, specimen receipt timing,
-    TAT metrics, QNS/TNP incident outcome tracking, and operational status analytics.
+    variant-aware TAT metrics, QNS/TNP incident outcome tracking, and operational
+    status analytics with incident detail.
 
   GRAIN: One row per ACCESSION_HUB_ID (enterprise accession with at least one
          RaDaR® ST test ordered since 2026-01-01).
@@ -20,7 +21,7 @@
       - Provides order statuses (ORDERED/CANCELLED), co-ordered test names, case numbers
       - Known gap: ~24-48 hour propagation lag for brand-new orders vs raw WORKLISTTABLE
 
-    Gold layer (84% of output columns — 64/76):
+    Gold layer (82% of output columns — 64/78):
       - V_GOLD_PANEL_TEST_DETAIL         : RaDaR test identification, variant statuses, additional tests
       - V_GOLD_ACCESSION                 : Order date, order type, bill type, disease stage, patient linkage
       - V_GOLD_CLIENT                    : Client name, number, city, state, zip, type-based exclusion
@@ -30,11 +31,11 @@
       - V_GOLD_RADAR_CLINICAL_INFORMATION: Tumor type, subtype, treatment, resection date, receiving facility
       - V_GOLD_RADAR_ORDER_OPTIONS       : Blood collection plan, cadence, test count, reminder intervals
                                            (populated for First Timepoint orders only — 100% for those, 0% for Follow-ups by design)
-      - V_GOLD_INCIDENT                  : QNS/TNP incidents (status, created/closed timestamps for outcome derivation),
-                                           all incident types list + count per accession
+      - V_GOLD_INCIDENT                  : QNS/TNP incidents (status, created/closed timestamps for outcome),
+                                           all incident types + statuses, incident count, detail list
       - T_E_LAB_ORDER_GROUP_HUB         : Bridge from radar order options to accession hub ID
 
-    Silver + Raw layer (16% of output columns — 12/76):
+    Silver + Raw layer (18% of output columns — 14/78):
       - DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE :
           1. WF_STEP_* (4 cols): Granular workflow step name per variant
              (Complete, Molecular Hold, Specimen in Transit, Cancelled, Molecular Tech, etc.)
@@ -46,10 +47,9 @@
       - DL_RAW_APVX_PRD.ORDERS.SPECIMENLOCATION (Raw):
           CHECKEDIN = 1 with CREATEDDATE as physical specimen receipt timestamp.
           Blood: uses 1st check-in (batch event IS the real blood receipt).
-          Tissue: HYBRID — uses 2nd check-in when 1st is batch, else RECEIVEDDATE fallback.
+          Tissue: HYBRID — uses 2nd check-in when 1st is batch (<60s from blood),
+          else RECEIVEDDATE fallback when no 2nd check-in, else 1st check-in if not batch.
           TISSUE_DATE_SOURCE column tracks which method was used per row.
-          Used for: FIRST_BLOOD_RECEIVED_DATE, FIRST_TISSUE_RECEIVED_DATE,
-          and derived metrics (TAT_DAYS, DAYS_IN_LAB, DAYS_TISSUE_TO_BLOOD, DAYS_TO_QNS_TNP).
       - DL_RAW_APVX_PRD.ORDERS.SPECIMEN (Raw):
           RECEIVEDDATE as fallback for tissue when no 2nd SPECIMENLOCATION check-in exists.
       - DL_RAW_APVX_PRD.ORDERS.CLIENT + CLIENTTYPE :
@@ -60,6 +60,11 @@
     CLIENT_TYPE_NAME IN ('Proficiency Test', 'Sample') plus LIKE patterns for
     TEST, SAMPLE, QC, QUALITY CONTROL, PROFICIENCY, DEMO, VALIDATION, DUMMY, UNKNOWN.
     Catches ~15 more clients than type-only filtering.
+
+  TAT LOGIC (variant-aware):
+    - First Timepoint: TAT = REPORTED_DATE - FIRST_TISSUE_RECEIVED (tissue is gating specimen)
+    - Follow-up Timepoint: TAT = REPORTED_DATE - FIRST_BLOOD_RECEIVED (blood-only test)
+    - DAYS_IN_LAB uses same logic inverted (specimen receipt → today for unreported orders)
 
   QNS/TNP OUTCOME LOGIC:
     Determines whether a QNS/TNP incident resulted in a true failure or was rescued:
@@ -82,7 +87,7 @@
       - Ordered                          : Order placed, not yet accessioned
 
   OUTPUT:
-    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (77 columns)
+    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (78 columns)
     Column groups:
       [1-2]   Order metadata: date, client name
       [3-7]   RaDaR variant statuses + first timepoint flag
@@ -102,18 +107,20 @@
       [59]    Receiving facility
       [60-61] Case lifecycle: REPORTED_DATE, CURRENT_STATUS (Ordered/In Progress/Reported/Cancelled)
       [62-63] Specimen receipt: FIRST_BLOOD_RECEIVED_DATE, FIRST_TISSUE_RECEIVED_DATE (hybrid logic)
-      [64-66] TAT metrics: TAT_DAYS (tissue→report for 1st TP, blood→report for follow-up), DAYS_IN_LAB, DAYS_TISSUE_TO_BLOOD
+      [64-66] TAT metrics: TAT_DAYS (variant-aware), DAYS_IN_LAB (variant-aware), DAYS_TISSUE_TO_BLOOD
       [67-69] QNS/TNP: HAS_QNS_TNP flag, QNS_TNP_STATUS, QNS_TNP_OUTCOME (True QNS/TNP | Rescued | Active)
-      [70-72] Incidents: INCIDENT_TYPES_LIST, INCIDENT_COUNT, DAYS_TO_QNS_TNP (tissue→first QNS incident)
+      [70-72] Incidents: INCIDENT_TYPES_LIST, INCIDENT_COUNT, DAYS_TO_QNS_TNP
       [73]    DETAILED_STATUS (9-value specimen-aware status hierarchy)
       [74-76] Binary flags: IS_REPORTED, IS_TRUE_QNS_TNP, IS_CANCELLED
       [77]    TISSUE_DATE_SOURCE (1st Check-in | 2nd Check-in | RECEIVEDDATE Fallback)
+      [78]    INCIDENT_DETAIL_LIST (all incidents with type + status, e.g. "QNS/TNP (Closed); CMR (Material Received)")
 
   REMAINING GOLD GAPS (backlog):
     - WF_STEP_* (4 cols): Need V_GOLD_CASE to expose granular lab workflow step names
     - PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): Need PanTracer in V_GOLD_PANEL or dedicated view
     - Specimen check-in timestamps (2 cols): Need Gold specimen view with SPECIMENLOCATION events
     - TAT/metric columns (5 cols): Derived from above — would become Gold once specimen dates are in Gold
+    - TISSUE_DATE_SOURCE (1 col): Diagnostic column — can be removed once specimen logic is validated
 */
 
 --select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
@@ -573,9 +580,10 @@ all_incidents AS (
     SELECT
         gi.ACCESSION_HUB_ID,
         LISTAGG(DISTINCT gi.INCIDENT_TYPE, '; ') WITHIN GROUP (ORDER BY gi.INCIDENT_TYPE) AS INCIDENT_TYPES_LIST,
-        COUNT(DISTINCT gi.INCIDENT_HUB_ID) AS INCIDENT_COUNT
+        COUNT(DISTINCT gi.INCIDENT_HUB_ID) AS INCIDENT_COUNT,
+        LISTAGG(DISTINCT COALESCE(gi.INCIDENT_TYPE, 'CMR') || ' (' || gi.STATUS || ')', '; ')
+            WITHIN GROUP (ORDER BY COALESCE(gi.INCIDENT_TYPE, 'CMR') || ' (' || gi.STATUS || ')') AS INCIDENT_DETAIL_LIST
     FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_INCIDENT gi
-    WHERE gi.INCIDENT_TYPE IS NOT NULL AND gi.INCIDENT_TYPE != ''
     GROUP BY gi.ACCESSION_HUB_ID
 )
 
@@ -669,7 +677,9 @@ SELECT
          WHEN MAX(rcw.REPORTED_TS) IS NOT NULL AND ra.IS_FIRST_TIMEPOINT = 0 AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
          THEN ROUND(DATEDIFF('hour', bsr.FIRST_BLOOD_RECEIVED_TS, MAX(rcw.REPORTED_TS)) / 24.0, 1)
     END AS TAT_DAYS,
-    CASE WHEN MAX(rcw.REPORTED_DATE) IS NULL AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
+    CASE WHEN MAX(rcw.REPORTED_DATE) IS NULL AND ra.IS_FIRST_TIMEPOINT = 1 AND tsr.FIRST_TISSUE_RECEIVED_TS IS NOT NULL
+         THEN ROUND(DATEDIFF('hour', tsr.FIRST_TISSUE_RECEIVED_TS, CURRENT_TIMESTAMP()) / 24.0, 1)
+         WHEN MAX(rcw.REPORTED_DATE) IS NULL AND ra.IS_FIRST_TIMEPOINT = 0 AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
          THEN ROUND(DATEDIFF('hour', bsr.FIRST_BLOOD_RECEIVED_TS, CURRENT_TIMESTAMP()) / 24.0, 1)
     END AS DAYS_IN_LAB,
     CASE WHEN tsr.FIRST_TISSUE_RECEIVED_TS IS NOT NULL AND bsr.FIRST_BLOOD_RECEIVED_TS IS NOT NULL
@@ -724,7 +734,8 @@ SELECT
     CASE WHEN MAX(CASE WHEN rcw.CURRENT_STATUS = 'Cancelled' THEN 1 END) = 1
               AND MAX(CASE WHEN rcw.CURRENT_STATUS IN ('Reported', 'In Progress', 'Ordered') THEN 1 END) IS NULL
          THEN 1 ELSE 0 END AS IS_CANCELLED,
-    tsr.TISSUE_DATE_SOURCE
+    tsr.TISSUE_DATE_SOURCE,
+    ai.INCIDENT_DETAIL_LIST
 FROM radar_accessions ra
 LEFT JOIN client_info ci
     ON ci.MASTER_CLIENT_HUB_ID = ra.MASTER_CLIENT_HUB_ID
@@ -775,7 +786,7 @@ GROUP BY
     rc.RECEIVING_FACILITY, bsr.FIRST_BLOOD_RECEIVED_DATE, bsr.FIRST_BLOOD_RECEIVED_TS,
     tsr.FIRST_TISSUE_RECEIVED_DATE, tsr.FIRST_TISSUE_RECEIVED_TS, tsr.TISSUE_DATE_SOURCE,
     qns.HAS_QNS_TNP, qns.QNS_TNP_STATUS, qns.FIRST_QNS_TNP_TS, qns.LAST_QNS_CLOSED_TS,
-    ai.INCIDENT_TYPES_LIST, ai.INCIDENT_COUNT;
+    ai.INCIDENT_TYPES_LIST, ai.INCIDENT_COUNT, ai.INCIDENT_DETAIL_LIST;
 
 
 
