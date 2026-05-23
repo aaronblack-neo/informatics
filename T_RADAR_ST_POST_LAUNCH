@@ -8,7 +8,7 @@
     Produces a single-row-per-accession dataset of all RaDaR® ST orders since
     the January 2026 product launch. Supports post-launch commercial monitoring
     including: order velocity, variant mix, cross-sell opportunity identification,
-    clinical context analysis, and workflow progression tracking.
+    clinical context analysis, workflow progression tracking, and specimen receipt timing.
 
   GRAIN: One row per ACCESSION_HUB_ID (enterprise accession with at least one
          RaDaR® ST test ordered since 2026-01-01).
@@ -19,11 +19,11 @@
       - Provides order statuses (ORDERED/CANCELLED), co-ordered test names, case numbers
       - Known gap: ~24-48 hour propagation lag for brand-new orders vs raw WORKLISTTABLE
 
-    Gold layer (92% of output columns — 53/59):
+    Gold layer (89% of output columns — 55/62):
       - V_GOLD_PANEL_TEST_DETAIL         : RaDaR test identification, variant statuses, additional tests
       - V_GOLD_ACCESSION                 : Order date, order type, bill type, disease stage, patient linkage
       - V_GOLD_CLIENT                    : Client name, number, city, state, zip, type-based exclusion
-      - V_GOLD_CASE                      : Per-variant workflow completion date (CASE WORKLIST LAST COMPLETED)
+      - V_GOLD_CASE                      : Per-variant workflow date, reported date, current status derivation
       - V_GOLD_PANEL                     : Co-ordered panels (same accession + cross-accession)
       - V_GOLD_ORDERING_PROVIDER_PIVOT   : Ordering provider name and NPI
       - V_GOLD_RADAR_CLINICAL_INFORMATION: Tumor type, subtype, treatment, resection date, receiving facility
@@ -31,13 +31,17 @@
                                            (populated for First Timepoint orders only — 100% for those, 0% for Follow-ups by design)
       - T_E_LAB_ORDER_GROUP_HUB         : Bridge from radar order options to accession hub ID
 
-    Raw layer (8% of output columns — 6/59):
+    Silver + Raw layer (11% of output columns — 7/62):
       - DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE :
           1. WF_STEP_* (4 cols): Granular workflow step name per variant
              (Complete, Molecular Hold, Specimen in Transit, Cancelled, Molecular Tech, etc.)
              V_GOLD_CASE only exposes high-level ORDERED/CANCELLED — not the lab step detail.
           2. PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): PanTracer panel detection via
              PANELS_TEXT regex. PanTracer panels are not yet surfaced in Gold panel views.
+      - DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB + T_M_SPECIMEN_TYPE_HUB (Silver):
+          Specimen type filter (blood/peripheral blood) and accession linkage.
+      - DL_RAW_APVX_PRD.ORDERS.SPECIMEN (Raw):
+          RECEIVEDDATE for first blood specimen received (1 col). Not in Gold.
       - DL_RAW_APVX_PRD.ORDERS.CLIENT + CLIENTTYPE :
           APVX CLIENTID-level exclusion for PanTracer CTE (mirrors Gold name-pattern exclusion).
 
@@ -48,7 +52,7 @@
     Catches ~15 more clients than type-only filtering.
 
   OUTPUT:
-    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (59 columns)
+    DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH (62 columns)
     Column groups:
       [1-2]   Order metadata: date, client name
       [3-7]   RaDaR variant statuses + first timepoint flag
@@ -66,10 +70,13 @@
       [50-52] Derived: TEST_TYPE, OVERALL_STATUS, PATIENT_ORDER_PROGRESSION
       [53-58] RaDaR order options: blood plan, cadence, test count, reminder, clinician/neo intervals
       [59]    Receiving facility
+      [60-61] Case lifecycle: REPORTED_DATE (first case signout), CURRENT_STATUS (Ordered/In Progress/Reported/Cancelled)
+      [62]    Specimen: FIRST_BLOOD_RECEIVED_DATE (first blood specimen received at lab)
 
   REMAINING GOLD GAPS (backlog):
     - WF_STEP_* (4 cols): Need V_GOLD_CASE to expose granular lab workflow step names
     - PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): Need PanTracer in V_GOLD_PANEL or dedicated view
+    - FIRST_BLOOD_RECEIVED_DATE (1 col): Need specimen received date in a Gold specimen view
 */
 
 --select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
@@ -185,7 +192,14 @@ radar_case_workflow AS (
     SELECT
         ptd.ACCESSION_HUB_ID,
         ptd.MASTER_TEST_ORDERNAME,
-        gc."CASE WORKLIST LAST COMPLETED DATETIME"::DATE AS WF_DATE
+        gc."CASE WORKLIST LAST COMPLETED DATETIME"::DATE AS WF_DATE,
+        gc."CASE FIRST COMPLETED DATETIME"::DATE AS REPORTED_DATE,
+        CASE
+            WHEN gc."CASE ORDER STATUS" = 'CANCELLED' THEN 'Cancelled'
+            WHEN gc."CASE FIRST COMPLETED DATETIME" IS NOT NULL THEN 'Reported'
+            WHEN gc."CASE WORKLIST LAST COMPLETED DATETIME" IS NOT NULL THEN 'In Progress'
+            ELSE 'Ordered'
+        END AS CURRENT_STATUS
     FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL ptd
     JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_CASE gc ON gc.CASE_HUB_ID = ptd.CASE_HUB_ID
     WHERE ptd.MASTER_TEST_ORDERNAME ILIKE '%radar%'
@@ -401,6 +415,25 @@ radar_order_options AS (
     FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_RADAR_ORDER_OPTIONS roo
     JOIN DW_ENTERPRISE_PRD.DW.T_E_LAB_ORDER_GROUP_HUB log ON log.ID = roo.E_LAB_ORDER_GROUP
     GROUP BY log.E_ACCESSION
+),
+
+-- ============================================================
+-- CTE 14: blood_specimen_received [SILVER + RAW]
+-- First blood specimen received date per accession.
+-- Joins DW specimen hub (type filter) to APVX raw specimen
+-- (received date). No Gold view yet exposes specimen received.
+-- ============================================================
+blood_specimen_received AS (
+    SELECT
+        sp.E_ACCESSION AS ACCESSION_HUB_ID,
+        MIN(apvx_sp.RECEIVEDDATE)::DATE AS FIRST_BLOOD_RECEIVED_DATE
+    FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
+    JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
+    JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMEN apvx_sp
+        ON apvx_sp.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER
+    WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%blood%'
+       OR stype.SPECIMEN_TYPE_NAME ILIKE '%peripheral%'
+    GROUP BY sp.E_ACCESSION
 )
 
 -- ============================================================
@@ -477,7 +510,16 @@ SELECT
     roo.REMINDER_REQUEST,
     roo.CLINICIAN_DIRECTED_INTERVALS,
     roo.NEO_MANAGED_INTERVALS,
-    rc.RECEIVING_FACILITY
+    rc.RECEIVING_FACILITY,
+    MAX(rcw.REPORTED_DATE) AS REPORTED_DATE,
+    CASE
+        WHEN MAX(CASE WHEN rcw.CURRENT_STATUS = 'Cancelled' THEN 1 END) = 1
+             AND MAX(CASE WHEN rcw.CURRENT_STATUS IN ('Reported', 'In Progress', 'Ordered') THEN 1 END) IS NULL THEN 'Cancelled'
+        WHEN MAX(CASE WHEN rcw.CURRENT_STATUS = 'Reported' THEN 1 END) = 1 THEN 'Reported'
+        WHEN MAX(CASE WHEN rcw.CURRENT_STATUS = 'In Progress' THEN 1 END) = 1 THEN 'In Progress'
+        ELSE 'Ordered'
+    END AS CURRENT_STATUS,
+    bsr.FIRST_BLOOD_RECEIVED_DATE
 FROM radar_accessions ra
 LEFT JOIN client_info ci
     ON ci.MASTER_CLIENT_HUB_ID = ra.MASTER_CLIENT_HUB_ID
@@ -501,6 +543,8 @@ LEFT JOIN patient_pantracer ppt
     ON ppt.PATIENTID = ra.APVX_PATIENT_ID
 LEFT JOIN radar_order_options roo
     ON roo.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
+LEFT JOIN blood_specimen_received bsr
+    ON bsr.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 GROUP BY
     ra.ORDER_DATE, ci.CLIENT_NAME,
     ra.RADAR_STATUS_FIRST_TIMEPOINT, ra.RADAR_STATUS_FIRST_TIMEPOINT_BLOOD,
@@ -517,7 +561,7 @@ GROUP BY
     op.ORDERING_PROVIDER_NPI, ra.E_PATIENT_HUB_ID,
     roo.BLOOD_COLLECTION_PLAN, roo.BLOOD_TESTING_CADENCE, roo.BLOOD_TEST_COUNT,
     roo.REMINDER_REQUEST, roo.CLINICIAN_DIRECTED_INTERVALS, roo.NEO_MANAGED_INTERVALS,
-    rc.RECEIVING_FACILITY;
+    rc.RECEIVING_FACILITY, bsr.FIRST_BLOOD_RECEIVED_DATE;
 
 
 
