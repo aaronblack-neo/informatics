@@ -3,6 +3,13 @@
   =================================================
   Run this AFTER the TRUNCATE+INSERT into T_RADAR_ST_POST_LAUNCH completes.
   Appends a daily snapshot row per accession to the history table with change flags.
+  Also captures DELETED accessions (present yesterday, absent today).
+
+  CHANGED_COLUMNS values:
+    - 'NEW'     : First appearance of this accession in the dataset
+    - 'DELETED' : Accession was in yesterday's snapshot but not in today's (excluded or removed)
+    - 'col1; col2' : Semicolon-delimited list of columns that changed vs prior day
+    - '' (empty): No changes detected (status quo)
 
   Add this as the NEXT CELL in your existing scheduled notebook.
 */
@@ -68,4 +75,46 @@ LEFT JOIN (
     FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH_HISTORY
     WHERE IS_STATUS_CHANGE = 1
     GROUP BY ACCESSION_HUB_ID
-) last_change ON last_change.ACCESSION_HUB_ID = curr.ACCESSION_HUB_ID;
+) last_change ON last_change.ACCESSION_HUB_ID = curr.ACCESSION_HUB_ID
+
+UNION ALL
+
+SELECT
+    CURRENT_DATE AS SNAPSHOT_DATE,
+    prev.ACCESSION_HUB_ID,
+    prev.ORDER_DATE,
+    prev.CLIENT_NAME,
+    prev.CLIENT_NUMBER,
+    'DELETED' AS DETAILED_STATUS,
+    prev.CURRENT_STATUS,
+    prev.IS_FIRST_TIMEPOINT,
+    prev.TEST_TYPE,
+    prev.OVERALL_STATUS,
+    prev.REPORTED_DATE,
+    prev.FIRST_BLOOD_RECEIVED_DATE,
+    prev.FIRST_TISSUE_RECEIVED_DATE,
+    prev.TAT_DAYS,
+    prev.DAYS_IN_LAB,
+    prev.DAYS_TISSUE_TO_BLOOD,
+    prev.HAS_QNS_TNP,
+    prev.QNS_TNP_OUTCOME,
+    prev.INCIDENT_COUNT,
+    prev.IS_REPORTED,
+    prev.IS_TRUE_QNS_TNP,
+    prev.IS_CANCELLED,
+    prev.WF_STEP_FIRST_TIMEPOINT,
+    prev.WF_STEP_FIRST_TIMEPOINT_BLOOD,
+    prev.WF_STEP_FOLLOWUP_TIMEPOINT,
+    prev.WF_STEP_PROCESS_AND_HOLD,
+    prev.TISSUE_DATE_SOURCE,
+    0 AS IS_NEW_ACCESSION,
+    1 AS IS_STATUS_CHANGE,
+    prev.DETAILED_STATUS AS PREV_DETAILED_STATUS,
+    'DELETED' AS CHANGED_COLUMNS,
+    DATEDIFF('day', prev.ORDER_DATE, CURRENT_DATE) AS DAYS_IN_CURRENT_STATUS
+FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH_HISTORY prev
+LEFT JOIN DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH curr
+    ON curr.ACCESSION_HUB_ID = prev.ACCESSION_HUB_ID
+WHERE prev.SNAPSHOT_DATE = CURRENT_DATE - 1
+  AND prev.CHANGED_COLUMNS != 'DELETED'
+  AND curr.ACCESSION_HUB_ID IS NULL;
