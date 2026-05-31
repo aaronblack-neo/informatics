@@ -151,26 +151,6 @@ WITH excluded_master_clients AS (
 ),
 
 -- ============================================================
--- CTE 0b: excluded_clients
--- APVX CLIENTID-level exclusion for PanTracer CTE only.
--- ============================================================
-excluded_clients AS (
-    SELECT DISTINCT c.CLIENTID
-    FROM DL_RAW_APVX_PRD.ORDERS.CLIENT c
-    JOIN DL_RAW_APVX_PRD.ORDERS.CLIENTTYPE ct ON c.CLIENTTYPEID = ct.CLIENTTYPEID
-    WHERE ct.CLIENTTYPENAME IN ('Sample', 'Proficiency Test')
-       OR UPPER(c.CLIENTNAME) LIKE '%TEST%'
-       OR UPPER(c.CLIENTNAME) LIKE '%SAMPLE%'
-       OR UPPER(c.CLIENTNAME) LIKE '%QC %'
-       OR UPPER(c.CLIENTNAME) LIKE '%QUALITY CONTROL%'
-       OR UPPER(c.CLIENTNAME) LIKE '%PROFICIENCY%'
-       OR UPPER(c.CLIENTNAME) LIKE '%DEMO%'
-       OR UPPER(c.CLIENTNAME) LIKE '%VALIDATION%'
-       OR UPPER(c.CLIENTNAME) LIKE '%DUMMY%'
-       OR UPPER(c.CLIENTNAME) = 'UNKNOWN'
-),
-
--- ============================================================
 -- CTE 1: radar_gold_base
 -- PRIMARY DRIVER: Identifies RaDaR accessions from Gold using
 -- MASTER_TEST_ORDERNAME. Pivots variant statuses and aggregates
@@ -418,27 +398,21 @@ radar_clinical AS (
 ),
 
 -- ============================================================
--- CTE 12: patient_pantracer [RAW DEPENDENCY]
+-- CTE 12: patient_pantracer [GOLD]
 -- PanTracer panel names for same patient in 2026.
--- Source: WORKLISTTABLE — PanTracer not yet in Gold panel views.
--- Backlog item: surface PanTracer in V_GOLD_PANEL to eliminate.
+-- Now sourced from V_GOLD_PANEL + V_GOLD_ACCESSION — eliminates
+-- WORKLISTTABLE dependency. Joins on E_PATIENT_HUB_ID.
 -- ============================================================
 patient_pantracer AS (
     SELECT
-        wl.PATIENTID,
-        LISTAGG(DISTINCT
-            CASE WHEN wl.PANELS_TEXT ILIKE '%PanTracer%'
-                 THEN REGEXP_SUBSTR(wl.PANELS_TEXT, 'NEO PanTracer[^`]*')
-            END, '; ')
-            WITHIN GROUP (ORDER BY
-            CASE WHEN wl.PANELS_TEXT ILIKE '%PanTracer%'
-                 THEN REGEXP_SUBSTR(wl.PANELS_TEXT, 'NEO PanTracer[^`]*')
-            END) AS PANTRACER_PANEL_NAME
-    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE wl
-    WHERE wl.PANELS_TEXT ILIKE '%PanTracer%'
-      AND wl.CREATEDDATE >= '2026-01-01'
-      AND wl.CLIENTID NOT IN (SELECT CLIENTID FROM excluded_clients)
-    GROUP BY wl.PATIENTID
+        acc.E_PATIENT_HUB_ID,
+        LISTAGG(DISTINCT p."MASTER PANEL ORDER NAME", '; ')
+            WITHIN GROUP (ORDER BY p."MASTER PANEL ORDER NAME") AS PANTRACER_PANEL_NAME
+    FROM DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL p
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_ACCESSION acc ON acc.ACCESSION_HUB_ID = p.ACCESSION_HUB_ID
+    WHERE p."MASTER PANEL ORDER NAME" ILIKE '%pantracer%'
+      AND acc."ACCESSION CREATED DATETIME" >= '2026-01-01'
+    GROUP BY acc.E_PATIENT_HUB_ID
 ),
 
 -- ============================================================
@@ -756,7 +730,7 @@ LEFT JOIN patient_all_tests_cross patc
 LEFT JOIN radar_clinical rc
     ON rc.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 LEFT JOIN patient_pantracer ppt
-    ON ppt.PATIENTID = ra.APVX_PATIENT_ID
+    ON ppt.E_PATIENT_HUB_ID = ra.E_PATIENT_HUB_ID
 LEFT JOIN radar_order_options roo
     ON roo.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 LEFT JOIN blood_specimen_received bsr
