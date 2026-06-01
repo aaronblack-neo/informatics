@@ -1,0 +1,102 @@
+/*
+  Column Comments for T_RADAR_ST_POST_LAUNCH
+  ===========================================
+  Run this after any DROP/RECREATE of the table to restore
+  embedded metadata for AI agents and documentation.
+*/
+
+COMMENT ON TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH IS 'RaDaR® ST Post-Launch Ordering Analysis. One row per accession with RaDaR ST test ordered since 2026-01-01. Tracks order status, variant mix, specimen receipt timing, TAT metrics, QNS/TNP outcomes, cross-sell opportunities, and 9-value detailed workflow status. 78 columns. Primary key: ACCESSION_HUB_ID.';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN ACCESSION_HUB_ID COMMENT 'Enterprise accession hub ID - primary key. One row per accession.',
+    COLUMN APVX_ACCESSION_ID COMMENT 'Original NeoLINK/APVX accession ID (source system numeric identifier).',
+    COLUMN E_PATIENT_HUB_ID COMMENT 'Enterprise patient hub ID. Used for cross-accession patient-level analysis.',
+    COLUMN APVX_PATIENT_ID COMMENT 'Original APVX patient ID. Derived from PATIENT_SOURCE_ID split.',
+    COLUMN CASE_NUMBERS COMMENT 'Comma-separated case numbers associated with this accession.',
+    COLUMN ORDER_DATE COMMENT 'Accession creation date (when the order was placed).',
+    COLUMN CLIENT_NAME COMMENT 'Ordering clinic or practice name.',
+    COLUMN CLIENT_NUMBER COMMENT 'NeoGenomics client account number.',
+    COLUMN CLIENT_CITY COMMENT 'Client facility city.',
+    COLUMN CLIENT_STATE COMMENT 'Client facility state.',
+    COLUMN CLIENT_ZIP COMMENT 'Client facility postal code.';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN DETAILED_STATUS COMMENT '9-value specimen-aware status: Cancelled, Reported - Rescued from QNS/TNP, Reported - QNS/TNP, Reported, QNS/TNP - Active, In Progress - Testing, In Progress - Awaiting Blood, In Progress - Awaiting Tissue, In Progress - Awaiting Specimens, Ordered.',
+    COLUMN CURRENT_STATUS COMMENT 'High-level status: Ordered, In Progress, Reported, or Cancelled.',
+    COLUMN OVERALL_STATUS COMMENT 'First non-null variant status via COALESCE (ORDERED or CANCELLED).',
+    COLUMN TEST_TYPE COMMENT 'Primary RaDaR variant classification: First Timepoint, Follow-up Timepoint, or Process and Hold.',
+    COLUMN IS_FIRST_TIMEPOINT COMMENT '1 if accession includes First Timepoint or First Timepoint (Blood) variant; 0 otherwise.',
+    COLUMN IS_REPORTED COMMENT '1 if any variant has been reported (case signed out); 0 otherwise.',
+    COLUMN IS_CANCELLED COMMENT '1 if ALL variants cancelled with no active/reported variants; 0 otherwise.',
+    COLUMN IS_TRUE_QNS_TNP COMMENT '1 if reported as true QNS/TNP (not rescued by new specimens); 0 otherwise.',
+    COLUMN PATIENT_ORDER_PROGRESSION COMMENT 'Sequential order number for this patient (e.g., "1 of 3", "2 of 3").';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN FIRST_BLOOD_RECEIVED_DATE COMMENT 'Date first blood specimen physically checked in at lab (SPECIMENLOCATION event).',
+    COLUMN FIRST_TISSUE_RECEIVED_DATE COMMENT 'Date first tissue specimen received at lab. Hybrid logic: 2nd check-in if 1st is batch, else RECEIVEDDATE fallback.',
+    COLUMN REPORTED_DATE COMMENT 'Date case was first signed out / report issued. MAX across all RaDaR variants.',
+    COLUMN TAT_DAYS COMMENT 'Turnaround time in days (1 decimal). First Timepoint: tissue received to report. Follow-up: blood received to report.',
+    COLUMN DAYS_IN_LAB COMMENT 'Days since gating specimen received for unreported orders. First TP: from tissue. Follow-up: from blood. NULL if reported.',
+    COLUMN DAYS_TISSUE_TO_BLOOD COMMENT 'Days between blood check-in and tissue receipt. Positive = tissue arrived after blood (typical).',
+    COLUMN TISSUE_DATE_SOURCE COMMENT 'Diagnostic: which method derived tissue date. Values: 1st Check-in, 2nd Check-in, RECEIVEDDATE Fallback.';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN RADAR_STATUS_FIRST_TIMEPOINT COMMENT 'Order status (ORDERED/CANCELLED) for RaDaR ST First Timepoint variant.',
+    COLUMN RADAR_STATUS_FIRST_TIMEPOINT_BLOOD COMMENT 'Order status (ORDERED/CANCELLED) for RaDaR ST First Timepoint (Blood) variant.',
+    COLUMN RADAR_STATUS_FOLLOWUP_TIMEPOINT COMMENT 'Order status (ORDERED/CANCELLED) for RaDaR ST Follow-up Timepoint variant.',
+    COLUMN RADAR_STATUS_PROCESS_AND_HOLD COMMENT 'Order status (ORDERED/CANCELLED) for RaDaR Process and Hold variant.',
+    COLUMN WF_STEP_FIRST_TIMEPOINT COMMENT 'Latest granular lab workflow step for First Timepoint (Complete, Molecular Hold, Specimen in Transit, etc.).',
+    COLUMN WF_DATE_FIRST_TIMEPOINT COMMENT 'Date of latest workflow completion for First Timepoint.',
+    COLUMN WF_STEP_FIRST_TIMEPOINT_BLOOD COMMENT 'Latest granular lab workflow step for First Timepoint (Blood).',
+    COLUMN WF_DATE_FIRST_TIMEPOINT_BLOOD COMMENT 'Date of latest workflow completion for Blood variant.',
+    COLUMN WF_STEP_FOLLOWUP_TIMEPOINT COMMENT 'Latest granular lab workflow step for Follow-up Timepoint.',
+    COLUMN WF_DATE_FOLLOWUP_TIMEPOINT COMMENT 'Date of latest workflow completion for Follow-up.',
+    COLUMN WF_STEP_PROCESS_AND_HOLD COMMENT 'Latest granular lab workflow step for Process and Hold.',
+    COLUMN WF_DATE_PROCESS_AND_HOLD COMMENT 'Date of latest workflow completion for Process and Hold.';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN TUMOR_TYPE COMMENT 'Primary tumor type from RaDaR clinical intake form.',
+    COLUMN TUMOR_SUBTYPE COMMENT 'Tumor subtype from RaDaR clinical intake form.',
+    COLUMN TUMOR_TYPE_OTHER COMMENT 'Free-text tumor type when Other selected on intake form.',
+    COLUMN TREATMENT_NAME COMMENT 'Treatment name from RaDaR clinical intake form.',
+    COLUMN TUMOR_TYPE_EXPRESSION COMMENT 'Tumor expression marker from clinical intake.',
+    COLUMN TREATMENT_TYPE_LIST COMMENT 'Comma-separated treatment types from clinical intake.',
+    COLUMN DISEASE_STAGE COMMENT 'TNM disease stage (0, I, II, III, IIIA, IIIB, IV) from order form.',
+    COLUMN RESECTION_DATE COMMENT 'Tumor resection date from clinical intake (proxy for diagnosis date).',
+    COLUMN RECEIVING_FACILITY COMMENT 'Lab facility receiving the specimen.',
+    COLUMN ORDERING_PROVIDER_NAME COMMENT 'Ordering provider full name.',
+    COLUMN ORDERING_PROVIDER_NPI COMMENT 'Ordering provider National Provider Identifier.',
+    COLUMN BILL_TYPE COMMENT 'Billing instruction (Client Bill, Insurance, Medicare).',
+    COLUMN ACCESSION_ORDER_TYPE COMMENT 'Order entry method: Paper (TRF), Interface (EMR), Online (1.0/2.0).';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN BLOOD_COLLECTION_PLAN COMMENT 'Blood draw method: Clinic-managed blood draws or NeoGenomics managed mobile phlebotomy. First Timepoint only.',
+    COLUMN BLOOD_TESTING_CADENCE COMMENT 'Testing frequency cadence. First Timepoint only.',
+    COLUMN BLOOD_TEST_COUNT COMMENT 'Number of sequential tests ordered: 1 blood test or 4 sequential blood tests. First Timepoint only.',
+    COLUMN REMINDER_REQUEST COMMENT 'Reminder cadence: Every 1 month, Every 2 months, Every quarter, No reminder. First Timepoint only.',
+    COLUMN CLINICIAN_DIRECTED_INTERVALS COMMENT 'Clinician-directed blood draw interval scheduling. First Timepoint only.',
+    COLUMN NEO_MANAGED_INTERVALS COMMENT 'NeoGenomics-managed interval scheduling (e.g., Every quarter). First Timepoint only.';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN HAS_QNS_TNP COMMENT '1 if accession has any QNS (Quantity Not Sufficient) or TNP (Test Not Performed) incident; 0 otherwise.',
+    COLUMN QNS_TNP_STATUS COMMENT 'Semicolon-delimited QNS/TNP incident statuses (Open, Closed, Awaiting Client Action1, Monitoring).',
+    COLUMN QNS_TNP_VARIANT COMMENT 'QNS/TNP outcome: True QNS/TNP (reported as failure), Rescued (new specimens worked), Active (awaiting resolution).',
+    COLUMN DAYS_TO_QNS_TNP COMMENT 'Days from tissue receipt to first QNS/TNP incident creation. NULL if no QNS or no tissue.',
+    COLUMN INCIDENT_COUNT COMMENT 'Count of distinct incidents for this accession (all types). 0 if none.',
+    COLUMN INCIDENT_TYPES_LIST COMMENT 'Semicolon-delimited distinct incident types (QNS/TNP, Specimen, Test Requisition, etc.).',
+    COLUMN INCIDENT_DETAIL_LIST COMMENT 'All incidents with type + status pairs (e.g., QNS/TNP (Closed); CMR (Material Received); Test Requisition (Closed)).';
+
+ALTER TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH ALTER
+    COLUMN HAS_ANY_ADDITIONAL_ORDER COMMENT '1 if ANY non-RaDaR test, panel, or PanTracer ordered for this patient (same or different accession); 0 otherwise.',
+    COLUMN ADDITIONAL_TESTS_SAME_ACCESSION COMMENT 'Semicolon-delimited non-RaDaR test names on the same accession.',
+    COLUMN ADDITIONAL_TESTS_CROSS_ACCESSION COMMENT 'Semicolon-delimited non-RaDaR test names across ALL accessions for same patient in 2026.',
+    COLUMN ADDITIONAL_PANELS_SAME_ACCESSION COMMENT 'Semicolon-delimited non-RaDaR panel names on same accession (e.g., NEO PanTracer Tissue).',
+    COLUMN TESTS_DIFF_ACCESSION COMMENT 'Semicolon-delimited non-RaDaR test names on different accessions for same patient.',
+    COLUMN PANELS_DIFF_ACCESSION COMMENT 'Semicolon-delimited non-RaDaR panel names on different accessions for same patient.',
+    COLUMN HAS_TESTS_SAME_ACCESSION COMMENT '1 if non-RaDaR tests exist on same accession; 0 otherwise.',
+    COLUMN HAS_PANELS_SAME_ACCESSION COMMENT '1 if non-RaDaR panels exist on same accession; 0 otherwise.',
+    COLUMN HAS_TESTS_DIFF_ACCESSION COMMENT '1 if same patient has non-RaDaR tests on different accessions in 2026; 0 otherwise.',
+    COLUMN HAS_PANELS_DIFF_ACCESSION COMMENT '1 if same patient has non-RaDaR panels on different accessions in 2026; 0 otherwise.',
+    COLUMN HAS_OTHER_TESTS COMMENT '1 if patient has any non-RaDaR tests across any accession; 0 otherwise.',
+    COLUMN PANTRACER_PANEL_NAME COMMENT 'PanTracer panel names ordered for same patient in 2026 (from V_GOLD_PANEL).',
+    COLUMN HAS_PANTRACER COMMENT '1 if same patient has any PanTracer panel order in 2026; 0 otherwise.';
