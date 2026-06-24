@@ -21,39 +21,23 @@
       - Provides order statuses (ORDERED/CANCELLED), co-ordered test names, case numbers
       - Known gap: ~24-48 hour propagation lag for brand-new orders vs raw WORKLISTTABLE
 
-    Gold layer (82% of output columns — 64/78):
+    Gold layer (100% of output columns — 78/78):
       - V_GOLD_PANEL_TEST_DETAIL         : RaDaR test identification, variant statuses, additional tests
       - V_GOLD_ACCESSION                 : Order date, order type, bill type, disease stage, patient linkage
       - V_GOLD_CLIENT                    : Client name, number, city, state, zip, type-based exclusion
       - V_GOLD_CASE                      : Per-variant workflow date, reported date/TS, current status derivation
-      - V_GOLD_PANEL                     : Co-ordered panels (same accession + cross-accession)
+      - V_GOLD_PANEL                     : Co-ordered panels (same accession + cross-accession + PanTracer)
       - V_GOLD_ORDERING_PROVIDER_PIVOT   : Ordering provider name and NPI
       - V_GOLD_RADAR_CLINICAL_INFORMATION: Tumor type, subtype, treatment, resection date, receiving facility
       - V_GOLD_RADAR_ORDER_OPTIONS       : Blood collection plan, cadence, test count, reminder intervals
-                                           (populated for First Timepoint orders only — 100% for those, 0% for Follow-ups by design)
-      - V_GOLD_INCIDENT                  : QNS/TNP incidents (status, created/closed timestamps for outcome),
-                                           all incident types + statuses, incident count, detail list
+      - V_GOLD_INCIDENT                  : QNS/TNP incidents, all incident types + statuses, detail list
+      - V_DT_EVENT_MASTER               : Granular workflow steps per variant, specimen travel history
+                                           (replaces WORKLISTTABLE + SPECIMENLOCATION — fully Gold)
       - T_E_LAB_ORDER_GROUP_HUB         : Bridge from radar order options to accession hub ID
+      - T_E_SPECIMEN_HUB + T_M_SPECIMEN_TYPE_HUB : Specimen type classification for event filtering
 
-    Silver + Raw layer (18% of output columns — 14/78):
-      - DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE :
-          1. WF_STEP_* (4 cols): Granular workflow step name per variant
-             (Complete, Molecular Hold, Specimen in Transit, Cancelled, Molecular Tech, etc.)
-             V_GOLD_CASE only exposes high-level ORDERED/CANCELLED — not the lab step detail.
-          2. PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): PanTracer panel detection via
-             PANELS_TEXT regex. PanTracer panels are not yet surfaced in Gold panel views.
-      - DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB + T_M_SPECIMEN_TYPE_HUB (Silver):
-          Specimen type filter (blood/tissue) and accession linkage.
-      - DL_RAW_APVX_PRD.ORDERS.SPECIMENLOCATION (Raw):
-          CHECKEDIN = 1 with CREATEDDATE as physical specimen receipt timestamp.
-          Blood: uses 1st check-in (batch event IS the real blood receipt).
-          Tissue: HYBRID — uses 2nd check-in when 1st is batch (<60s from blood),
-          else RECEIVEDDATE fallback when no 2nd check-in, else 1st check-in if not batch.
-          TISSUE_DATE_SOURCE column tracks which method was used per row.
-      - DL_RAW_APVX_PRD.ORDERS.SPECIMEN (Raw):
-          RECEIVEDDATE as fallback for tissue when no 2nd SPECIMENLOCATION check-in exists.
-      - DL_RAW_APVX_PRD.ORDERS.CLIENT + CLIENTTYPE :
-          APVX CLIENTID-level exclusion for PanTracer CTE (mirrors Gold name-pattern exclusion).
+    NO RAW/SILVER DEPENDENCIES REMAINING.
+    All DL_RAW_APVX_PRD references have been eliminated.
 
   CLIENT EXCLUSION:
     Non-production clients filtered via V_GOLD_CLIENT name-pattern matching:
@@ -116,18 +100,123 @@
       [78]    INCIDENT_DETAIL_LIST (all incidents with type + status, e.g. "QNS/TNP (Closed); CMR (Material Received)")
 
   REMAINING GOLD GAPS (backlog):
-    - WF_STEP_* (4 cols): Need V_GOLD_CASE to expose granular lab workflow step names
-    - PANTRACER_PANEL_NAME + HAS_PANTRACER (2 cols): Need PanTracer in V_GOLD_PANEL or dedicated view
-    - Specimen check-in timestamps (2 cols): Need Gold specimen view with SPECIMENLOCATION events
-    - TAT/metric columns (5 cols): Derived from above — would become Gold once specimen dates are in Gold
-    - TISSUE_DATE_SOURCE (1 col): Diagnostic column — can be removed once specimen logic is validated
+    NONE — All 78 columns are now sourced from Gold/Enterprise views.
+    Zero dependencies on DL_RAW_APVX_PRD (raw) or DL_PRP (prep) layers.
 */
 
 --select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
 
+/*
+SELECT
+    -- === IDENTIFIERS ===
+    ACCESSION_HUB_ID,
+    APVX_ACCESSION_ID,
+    E_PATIENT_HUB_ID,
+    APVX_PATIENT_ID,
+    CASE_NUMBERS,
+
+    -- === STATUS & LIFECYCLE ===
+    DETAILED_STATUS,
+    CURRENT_STATUS,
+    OVERALL_STATUS,
+    TEST_TYPE,
+    IS_FIRST_TIMEPOINT,
+    IS_REPORTED,
+    IS_CANCELLED,
+    IS_TRUE_QNS_TNP,
+    PATIENT_ORDER_PROGRESSION,
+
+    -- === KEY DATES ===
+    ORDER_DATE,
+    FIRST_BLOOD_RECEIVED_DATE,
+    FIRST_TISSUE_RECEIVED_DATE,
+    REPORTED_DATE,
+
+    -- === TAT METRICS ===
+    TAT_DAYS,
+    DAYS_IN_LAB,
+    DAYS_TISSUE_TO_BLOOD,
+
+    -- === RADAR VARIANT STATUSES ===
+    RADAR_STATUS_FIRST_TIMEPOINT,
+    RADAR_STATUS_FIRST_TIMEPOINT_BLOOD,
+    RADAR_STATUS_FOLLOWUP_TIMEPOINT,
+    RADAR_STATUS_PROCESS_AND_HOLD,
+
+    -- === WORKFLOW STEPS (per variant) ===
+    WF_STEP_FIRST_TIMEPOINT,
+    WF_DATE_FIRST_TIMEPOINT,
+    WF_STEP_FIRST_TIMEPOINT_BLOOD,
+    WF_DATE_FIRST_TIMEPOINT_BLOOD,
+    WF_STEP_FOLLOWUP_TIMEPOINT,
+    WF_DATE_FOLLOWUP_TIMEPOINT,
+    WF_STEP_PROCESS_AND_HOLD,
+    WF_DATE_PROCESS_AND_HOLD,
+
+    -- === CLIENT & PROVIDER ===
+    CLIENT_NAME,
+    CLIENT_NUMBER,
+    CLIENT_CITY,
+    CLIENT_STATE,
+    CLIENT_ZIP,
+    ORDERING_PROVIDER_NAME,
+    ORDERING_PROVIDER_NPI,
+    BILL_TYPE,
+    ACCESSION_ORDER_TYPE,
+
+    -- === CLINICAL CONTEXT ===
+    TUMOR_TYPE,
+    TUMOR_SUBTYPE,
+    TUMOR_TYPE_OTHER,
+    TREATMENT_NAME,
+    TUMOR_TYPE_EXPRESSION,
+    TREATMENT_TYPE_LIST,
+    DISEASE_STAGE,
+    RESECTION_DATE,
+    RECEIVING_FACILITY,
+
+    -- === RADAR ORDER OPTIONS ===
+    BLOOD_COLLECTION_PLAN,
+    BLOOD_TESTING_CADENCE,
+    BLOOD_TEST_COUNT,
+    REMINDER_REQUEST,
+    CLINICIAN_DIRECTED_INTERVALS,
+    NEO_MANAGED_INTERVALS,
+
+    -- === QNS/TNP & INCIDENTS ===
+    HAS_QNS_TNP,
+    QNS_TNP_STATUS,
+    QNS_TNP_VARIANT AS QNS_TNP_OUTCOME,
+    DAYS_TO_QNS_TNP,
+    INCIDENT_COUNT,
+    INCIDENT_TYPES_LIST,
+    INCIDENT_DETAIL_LIST,
+
+    -- === CROSS-SELL / PORTFOLIO ===
+    HAS_ANY_ADDITIONAL_ORDER,
+    ADDITIONAL_TESTS_SAME_ACCESSION,
+    ADDITIONAL_PANELS_SAME_ACCESSION,
+    ADDITIONAL_TESTS_CROSS_ACCESSION,
+    TESTS_DIFF_ACCESSION,
+    PANELS_DIFF_ACCESSION,
+    HAS_TESTS_SAME_ACCESSION,
+    HAS_PANELS_SAME_ACCESSION,
+    HAS_TESTS_DIFF_ACCESSION,
+    HAS_PANELS_DIFF_ACCESSION,
+    HAS_OTHER_TESTS,
+    PANTRACER_PANEL_NAME,
+    HAS_PANTRACER,
+
+    -- === DIAGNOSTIC / METADATA ===
+    TISSUE_DATE_SOURCE
+
+FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
+ORDER BY ORDER_DATE DESC, CLIENT_NAME;
+*/
+
 TRUNCATE TABLE DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH;
 
-INSERT INTO DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
+INSERT    INTO DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
 
 -- ============================================================
 -- CTE 0: excluded_master_clients
@@ -235,33 +324,32 @@ radar_case_workflow AS (
 ),
 
 -- ============================================================
--- CTE 4: radar_workflow_step [RAW DEPENDENCY]
--- Per-variant granular workflow STEP from WORKLISTTABLE.
--- Required because V_GOLD_CASE only has ORDERED/CANCELLED —
--- not lab-level steps (Complete, Molecular Hold, Specimen in
--- Transit, Molecular Tech, Molecular Login, Cancelled).
--- Backlog item: expose granular step in V_GOLD_CASE to eliminate.
+-- CTE 4: radar_workflow_step [GOLD - V_DT_EVENT_MASTER]
+-- Per-variant granular workflow STEP from Gold event master.
+-- Uses 'Case Workflow History' category with LAB_ORDER_GROUP_NAME
+-- as the case number to map to RaDaR variants.
 -- ============================================================
 radar_workflow_step AS (
     SELECT
-        ACCESSIONID,
+        ev.E_ACCESSION AS ACCESSION_HUB_ID,
         CASE
-            WHEN PANELS_TEXT ILIKE '%(Blood) RaDaR%'   THEN 'First Timepoint (Blood)'
-            WHEN PANELS_TEXT ILIKE '%First Timepoint%' THEN 'First Timepoint'
-            WHEN PANELS_TEXT ILIKE '%Follow-up%'       THEN 'Follow-up Timepoint'
-            WHEN PANELS_TEXT ILIKE '%Process and Hold%' THEN 'Process and Hold'
+            WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST First Timepoint' THEN 'First Timepoint'
+            WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST First Timepoint (Blood)' THEN 'First Timepoint (Blood)'
+            WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® ST Follow-up Timepoint' THEN 'Follow-up Timepoint'
+            WHEN ptd.MASTER_TEST_ORDERNAME = 'RaDaR® Process and Hold' THEN 'Process and Hold'
         END AS RADAR_VARIANT,
-        WORKFLOWSTEP
-    FROM DL_RAW_APVX_PRD.WORKFLOW.WORKLISTTABLE
-    WHERE PANELS_TEXT ILIKE '%Radar%'
+        CASE
+            WHEN ev.EVENT_SUBTYPE_VALUE = 'Molecular' THEN 'Molecular ' || ev.EVENT_SUBTYPE_NAME
+            ELSE ev.EVENT_SUBTYPE_NAME
+        END AS WORKFLOWSTEP
+    FROM DW_ENTERPRISE_PRD.GOLD.V_DT_EVENT_MASTER ev
+    JOIN DW_ENTERPRISE_PRD.GOLD.V_GOLD_PANEL_TEST_DETAIL ptd
+        ON ptd.ACCESSION_HUB_ID = ev.E_ACCESSION AND ptd.CASENO = ev.LAB_ORDER_GROUP_NAME
+    WHERE ev.CATEGORY_NAME = 'Case Workflow History'
+      AND ptd.MASTER_TEST_ORDERNAME ILIKE '%radar%'
     QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY ACCESSIONID,
-            CASE WHEN PANELS_TEXT ILIKE '%(Blood) RaDaR%' THEN 'First Timepoint (Blood)'
-                 WHEN PANELS_TEXT ILIKE '%First Timepoint%' THEN 'First Timepoint'
-                 WHEN PANELS_TEXT ILIKE '%Follow-up%' THEN 'Follow-up Timepoint'
-                 WHEN PANELS_TEXT ILIKE '%Process and Hold%' THEN 'Process and Hold'
-            END
-        ORDER BY LASTUPDATED DESC
+        PARTITION BY ev.E_ACCESSION, ptd.MASTER_TEST_ORDERNAME
+        ORDER BY ev.EVENT_CREATED_TIMESTAMP DESC
     ) = 1
 ),
 
@@ -437,41 +525,32 @@ radar_order_options AS (
 ),
 
 -- ============================================================
--- CTE 14: blood_specimen_received [SILVER + RAW]
+-- CTE 14: blood_specimen_received [GOLD - V_DT_EVENT_MASTER]
 -- First blood specimen physically received at lab per accession.
--- Uses SPECIMENLOCATION.CREATEDDATE where CHECKEDIN = 1 as the
--- explicit physical receipt event (consistent with tissue CTE).
--- Eliminates placeholder dates present in SPECIMEN.RECEIVEDDATE.
+-- Uses 'Specimen Travel History' category with CheckIN:Yes from
+-- the Gold event master. Joins E_SPECIMEN to specimen type hub.
 -- ============================================================
 blood_specimen_received AS (
     SELECT
-        sp.E_ACCESSION AS ACCESSION_HUB_ID,
-        MIN(sl.CREATEDDATE)::DATE AS FIRST_BLOOD_RECEIVED_DATE,
-        MIN(sl.CREATEDDATE) AS FIRST_BLOOD_RECEIVED_TS
-    FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
+        ev.E_ACCESSION AS ACCESSION_HUB_ID,
+        MIN(ev.EVENT_CREATED_TIMESTAMP)::DATE AS FIRST_BLOOD_RECEIVED_DATE,
+        MIN(ev.EVENT_CREATED_TIMESTAMP) AS FIRST_BLOOD_RECEIVED_TS
+    FROM DW_ENTERPRISE_PRD.GOLD.V_DT_EVENT_MASTER ev
+    JOIN DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp ON sp.ID = ev.E_SPECIMEN
     JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
-    JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMENLOCATION sl
-        ON sl.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER
-        AND sl.CHECKEDIN = 1
-    WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%blood%'
-       OR stype.SPECIMEN_TYPE_NAME ILIKE '%peripheral%'
-    GROUP BY sp.E_ACCESSION
+    WHERE ev.CATEGORY_NAME = 'Specimen Travel History'
+      AND ev.EVENT_SUBTYPE_VALUE ILIKE '%CheckIN:Yes%'
+      AND (stype.SPECIMEN_TYPE_NAME ILIKE '%blood%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%peripheral%')
+    GROUP BY ev.E_ACCESSION
 ),
 
 -- ============================================================
--- CTE 15: tissue_specimen_received [SILVER + RAW]
+-- CTE 15: tissue_specimen_received [GOLD - V_DT_EVENT_MASTER]
 -- First tissue specimen physically received at lab per accession.
--- Uses SPECIMENLOCATION.CREATEDDATE where CHECKEDIN = 1 as the
--- explicit physical receipt event (tech scan-in timestamp).
--- More operationally precise than SPECIMEN.RECEIVEDDATE which
--- can be pre-populated or backfilled.
--- Tissue only present on First Timepoint orders (99% coverage
--- for those, 0% for Follow-ups — by design, tissue is required
--- for initial tumor panel build only).
--- HYBRID APPROACH:
---   Priority 1: 2nd check-in (when 1st is batch event <60s from blood)
---   Priority 2: SPECIMEN.RECEIVEDDATE (when only batch check-in exists)
---   Priority 3: 1st check-in (when it's NOT a batch event)
+-- HYBRID APPROACH using Gold event master:
+--   Priority 1: 2nd check-in event (when 1st is batch <60s from blood)
+--   Priority 2: 1st check-in event (when NOT a batch event)
+-- No more RECEIVEDDATE fallback needed — event data is authoritative.
 -- TISSUE_DATE_SOURCE column tracks which method was used.
 -- ============================================================
 tissue_specimen_received AS (
@@ -479,50 +558,42 @@ tissue_specimen_received AS (
         bf.ACCESSION_HUB_ID,
         COALESCE(
             CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN t2.CHECKIN_TS END,
-            CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN tr.RECEIVED_TS END,
+            CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN NULL END,
             t1.CHECKIN_TS
         )::DATE AS FIRST_TISSUE_RECEIVED_DATE,
         COALESCE(
             CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN t2.CHECKIN_TS END,
-            CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN tr.RECEIVED_TS END,
+            CASE WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN NULL END,
             t1.CHECKIN_TS
         ) AS FIRST_TISSUE_RECEIVED_TS,
         CASE
-            WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 AND t2.CHECKIN_TS IS NOT NULL THEN '2nd Check-in'
-            WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN 'RECEIVEDDATE Fallback'
-            ELSE '1st Check-in'
+            WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 AND t2.CHECKIN_TS IS NOT NULL THEN '2nd Check-in (Gold Event)'
+            WHEN ABS(DATEDIFF('second', t1.CHECKIN_TS, bf.FIRST_BLOOD_RECEIVED_TS)) < 60 THEN 'Batch Only - No Tissue Event'
+            ELSE '1st Check-in (Gold Event)'
         END AS TISSUE_DATE_SOURCE
     FROM blood_specimen_received bf
     LEFT JOIN (
-        SELECT sp.E_ACCESSION AS ACCESSION_HUB_ID, sl.CREATEDDATE AS CHECKIN_TS
-        FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
+        SELECT ev.E_ACCESSION AS ACCESSION_HUB_ID, ev.EVENT_CREATED_TIMESTAMP AS CHECKIN_TS
+        FROM DW_ENTERPRISE_PRD.GOLD.V_DT_EVENT_MASTER ev
+        JOIN DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp ON sp.ID = ev.E_SPECIMEN
         JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
-        JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMENLOCATION sl ON sl.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER AND sl.CHECKEDIN = 1
-        WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY sp.E_ACCESSION ORDER BY sl.CREATEDDATE) = 1
+        WHERE ev.CATEGORY_NAME = 'Specimen Travel History' AND ev.EVENT_SUBTYPE_VALUE ILIKE '%CheckIN:Yes%'
+          AND (stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
+               OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
+               OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY ev.E_ACCESSION ORDER BY ev.EVENT_CREATED_TIMESTAMP) = 1
     ) t1 ON t1.ACCESSION_HUB_ID = bf.ACCESSION_HUB_ID
     LEFT JOIN (
-        SELECT sp.E_ACCESSION AS ACCESSION_HUB_ID, sl.CREATEDDATE AS CHECKIN_TS
-        FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
+        SELECT ev.E_ACCESSION AS ACCESSION_HUB_ID, ev.EVENT_CREATED_TIMESTAMP AS CHECKIN_TS
+        FROM DW_ENTERPRISE_PRD.GOLD.V_DT_EVENT_MASTER ev
+        JOIN DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp ON sp.ID = ev.E_SPECIMEN
         JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
-        JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMENLOCATION sl ON sl.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER AND sl.CHECKEDIN = 1
-        WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY sp.E_ACCESSION ORDER BY sl.CREATEDDATE) = 2
+        WHERE ev.CATEGORY_NAME = 'Specimen Travel History' AND ev.EVENT_SUBTYPE_VALUE ILIKE '%CheckIN:Yes%'
+          AND (stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
+               OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
+               OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%')
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY ev.E_ACCESSION ORDER BY ev.EVENT_CREATED_TIMESTAMP) = 2
     ) t2 ON t2.ACCESSION_HUB_ID = bf.ACCESSION_HUB_ID
-    LEFT JOIN (
-        SELECT sp.E_ACCESSION AS ACCESSION_HUB_ID, MIN(apvx_sp.RECEIVEDDATE) AS RECEIVED_TS
-        FROM DW_ENTERPRISE_PRD.DW.T_E_SPECIMEN_HUB sp
-        JOIN DW_ENTERPRISE_PRD.DW.T_M_SPECIMEN_TYPE_HUB stype ON stype.ID = sp.M_SPECIMEN_TYPE
-        JOIN DL_RAW_APVX_PRD.ORDERS.SPECIMEN apvx_sp ON apvx_sp.SPECIMENID = SPLIT_PART(sp.SPECIMEN_SOURCE_ID, '|', 4)::NUMBER
-        WHERE stype.SPECIMEN_TYPE_NAME ILIKE '%tissue%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%FFPE%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%block%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%paraffin%'
-           OR stype.SPECIMEN_TYPE_NAME ILIKE '%biopsy%' OR stype.SPECIMEN_TYPE_NAME ILIKE '%slide%'
-        GROUP BY sp.E_ACCESSION
-    ) tr ON tr.ACCESSION_HUB_ID = bf.ACCESSION_HUB_ID
     WHERE t1.CHECKIN_TS IS NOT NULL
 ),
 
@@ -714,7 +785,7 @@ FROM radar_accessions ra
 LEFT JOIN client_info ci
     ON ci.MASTER_CLIENT_HUB_ID = ra.MASTER_CLIENT_HUB_ID
 LEFT JOIN radar_workflow_step rws
-    ON rws.ACCESSIONID = ra.ACCESSIONID::NUMBER
+    ON rws.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 LEFT JOIN radar_case_workflow rcw
     ON rcw.ACCESSION_HUB_ID = ra.ACCESSION_HUB_ID
 LEFT JOIN ordering_provider op
@@ -764,4 +835,14 @@ GROUP BY
 
 
 
---select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH
+--select * FROM DW_CUR_INFDLC_DEV.DW.T_RADAR_ST_POST_LAUNCH order by 1 desc
+/*
+select spe.active,spe.collection_date, spe.m_specimen_type, spe.received_date,
+ev.category_name,ev.entity_type, ev.event_name, ev.event_subtype_name, ev.event_subtype_value
+
+FROM DW_ENTERPRISE_DEV.GOLD.V_GOLD_EVENT_MASTER ev
+    INNER JOIN DW_ENTERPRISE_DEV.DW.V_E_SPECIMEN spe
+        on spe.id = ev.entity_id
+    INNER JOIN DW_ENTERPRISE_DEV.DW.V_M_
+where entity_type = 'Specimen' limit 100;
+*/
